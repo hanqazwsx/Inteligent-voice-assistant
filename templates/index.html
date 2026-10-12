@@ -308,9 +308,9 @@
       {%- if m.has_soap %}
       <div class="soap">
         {%- for sec in m.soap_sections %}
-        <div class="soap-block">
-          <span class="soap-label">{{ sec.label }}</span>
-          <div class="soap-body" contenteditable="true" data-field="{{ sec.key }}" data-placeholder="点击补充" spellcheck="false">{{ m[sec.key] }}</div>
+        <div class="soap-block" data-section="{{ sec.key }}">
+          <span class="soap-label">{% if sec.icon %}{{ sec.icon }} {% endif %}{{ sec.label }}</span>
+          <div class="soap-body" contenteditable="true" data-field="{{ sec.key }}" data-placeholder="未提及 · 点击补充" spellcheck="false">{{ m[sec.key] }}</div>
         </div>
         {%- endfor %}
       </div>
@@ -431,10 +431,18 @@
       "</span>";
   }
 
+  // 空段显示成灰色的"未提及 · 点击补充"：这一句**只在 CSS 里画**（见 .soap-body:empty::before），
+  // 不进 DOM —— 真写进去的话，一按保存就把"未提及"三个字存成了病历内容，
+  // 从此再也分不清"他问了，患者说没有"和"他压根没问"。
+  const SOAP_PLACEHOLDER = "未提及 · 点击补充";
+
   function soapBlock(section, body) {
-    return '<div class="soap-block"><span class="soap-label">' + esc(section.label) + "</span>" +
+    const icon = section.icon ? esc(section.icon) + " " : "";
+    return '<div class="soap-block" data-section="' + esc(section.key) +
+      '"><span class="soap-label">' + icon + esc(section.label) + "</span>" +
       '<div class="soap-body" contenteditable="true" spellcheck="false" data-field="' +
-      esc(section.key) + '" data-placeholder="点击补充">' + esc(body || "") + "</div></div>";
+      esc(section.key) + '" data-placeholder="' + SOAP_PLACEHOLDER + '">' +
+      esc(body || "") + "</div></div>";
   }
 
   // 空白栏目也要渲染出来（占位提示由 CSS 画），否则学生想补一段"诊疗计划"却无处可点

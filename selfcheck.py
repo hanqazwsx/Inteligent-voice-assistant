@@ -385,7 +385,7 @@ def check_mock_flow(conn: sqlite3.Connection | None) -> None:
     # --- 4.2 字段归一化 ---
     messy = {"title": "", "category": None, "summary": "  ", "todos": ["直接写字符串", {"content": "对象写 content"}, None, {"task": ""}]}
     normalized = main.normalize_memo(messy, "买牛奶", "2026-10-08 10:00:00")
-    # 只要求**核心字段**兜住：SOAP 五段对非问诊内容是空串，拿 REQUIRED_COLUMNS 整体
+    # 只要求**核心字段**兜住：病历八段对非问诊内容是空串，拿 REQUIRED_COLUMNS 整体
     # 断言"都非空"会把"日常备忘不该长病历"这条设计判成失败。
     core = ("record_time", "raw_text", "title", "category", "summary", "todos")
     check(all(normalized[k] for k in core), "字段归一化 · 空值兜底",
@@ -1617,7 +1617,7 @@ NAMED_MEDICAL_WORDS = ("主诉", "现病史", "体格检查", "心前区", "听�
 
 
 def check_medical_mode(tmp_dir: Path) -> None:
-    """请求 G 的验收点：热词提示词、识别后校正、SOAP 五段、老库无痛升级。
+    """请求 G 的验收点：热词提示词、识别后校正、病历八段（含三条独立的病史）、老库无痛升级。
 
     刻意用**独立的数据库文件**，不碰主连接：这一组会插入带 SOAP 内容的病历卡片，
     而 Web 那组是按 ``body.count("## ")`` 统计条目数的 —— SOAP 段渲染成 ``### 主诉``，
@@ -1700,14 +1700,34 @@ def check_medical_mode(tmp_dir: Path) -> None:
           "ASR_HOTWORD_CORRECT=false 时关掉整层校正",
           "_fix_terms 是这一层的开关包装，关掉就原样返回")
 
-    # --- 9.5.3 SOAP 结构 ---
-    check(main.SOAP_COLUMNS == ("chief_complaint", "history", "physical_exam",
-                                "assessment", "plan"),
-          "SOAP 五段 · 顺序与列名",
-          "主诉 → 现病史 → 体格检查 → 诊断思考 → 诊疗计划（卡片/Markdown/DOCX 共用这一份）")
-    check([label for _key, label in main.SOAP_SECTIONS] == ["主诉", "现病史", "体格检查",
+    # --- 9.5.3 病历结构（八段，三条病史各自独立）---
+    check(main.SOAP_COLUMNS == ("chief_complaint", "history", "past_history",
+                                "personal_history", "family_history",
+                                "physical_exam", "assessment", "plan"),
+          "病历八段 · 顺序与列名",
+          "主诉 → 现病史 → 既往史 → 个人史 → 家族史 → 体格检查 → 诊断思考 → 诊疗计划"
+          "（卡片/Markdown/DOCX 共用这一份）")
+    check([label for _key, label in main.SOAP_SECTIONS] == ["主诉", "现病史", "既往史",
+                                                           "个人史", "家族史", "体格检查",
                                                            "诊断思考", "诊疗计划"],
-          "SOAP 五段 · 中文标题", "问诊实训报告的标准栏目名")
+          "病历八段 · 中文标题", "问诊实训报告的标准栏目名")
+    check(main.SOAP_SECTIONS.index(("history", "现病史"))
+          < main.SOAP_SECTIONS.index(("past_history", "既往史"))
+          < main.SOAP_SECTIONS.index(("personal_history", "个人史"))
+          < main.SOAP_SECTIONS.index(("family_history", "家族史"))
+          < main.SOAP_SECTIONS.index(("physical_exam", "体格检查")),
+          "三条病史 · 夹在现病史与体格检查之间、彼此独立",
+          "现病史 → 既往史 → 个人史 → 家族史 → 体格检查，是病历书写的规范顺序；"
+          "合成一段「既往史」的话，模型得自己猜哪句属于哪栏")
+    check(set(main.SOAP_ICONS) == {"past_history", "personal_history", "family_history"}
+          and all(main.SOAP_ICONS.values()),
+          "三条病史 · 卡片上各有图标",
+          "📋 既往史 / 👤 个人史 / 👨‍👩‍👧 家族史 —— 图标只给需要区分的这三段")
+    check(all(icon not in label for _key, label in main.SOAP_SECTIONS
+              for icon in main.SOAP_ICONS.values()),
+          "病历标题 · 中文标题里不带 emoji",
+          "Markdown/DOCX 的标题直接取自 SOAP_SECTIONS 的第二项，"
+          "图标只在卡片上贴 —— 病历文书里不该印 emoji")
     check(set(main.EDITABLE_FIELDS) <= set(main.REGENERATE_FIELDS)
           and {"category", "todos"} <= set(main.REGENERATE_FIELDS),
           "字段白名单 · 可编辑 ⊆ 可重新生成",
@@ -1717,18 +1737,65 @@ def check_medical_mode(tmp_dir: Path) -> None:
     check(not (set(main.EDITABLE_FIELDS) & {"category", "todos"}),
           "字段白名单 · category/todos 不给手改", "两个白名单的差集就是这里刻意留的")
     check(set(main.SOAP_COLUMNS) <= set(main.EDITABLE_FIELDS),
-          "字段白名单 · SOAP 五段都允许手工修改", "卡片上的 SOAP 区域直接可编辑")
+          "字段白名单 · 八段都允许手工修改", "卡片上的病历区域直接可编辑")
+    check({"past_history", "personal_history", "family_history"} <= set(main.CLINICAL_FACT_FIELDS),
+          "三条病史 · 都算「问诊得来的客观事实」",
+          f"CLINICAL_FACT_FIELDS = {main.CLINICAL_FACT_FIELDS} —— 三条病史和现病史、体格检查"
+          "一样只能来自学生问到的东西，漏掉的话模型会把它们当成可以自由补全的内容")
 
     med_text = ("主诉腹痛三天。现病史三天前吃了火锅，之后上腹持续隐痛，伴恶心呕吐。"
+                "既往史有胃溃疡病史五年，无手术外伤史。个人史吸烟二十年，每天一包。"
+                "家族史父亲患高血压。"
                 "体格检查上腹压痛阳性，无反跳痛。初步诊断急性胃炎。"
                 "诊疗计划血常规加急诊胃镜。")
     soap = main.split_spoken_soap(med_text)
     check(soap["chief_complaint"] == "腹痛三天" and soap["history"].startswith("三天前吃了火锅")
           and soap["physical_exam"] == "上腹压痛阳性，无反跳痛"
           and soap["assessment"] == "急性胃炎" and soap["plan"] == "血常规加急诊胃镜",
-          "本地兜底 · 按口语栏目名切出 SOAP 五段",
+          "本地兜底 · 按口语栏目名切出病历各段",
           f"主诉={soap['chief_complaint']!r} · 现病史={soap['history'][:12]!r}… · "
           f"体查={soap['physical_exam']!r}")
+    check(soap["past_history"].startswith("有胃溃疡病史五年")
+          and soap["personal_history"].startswith("吸烟二十年")
+          and soap["family_history"].startswith("父亲患高血压"),
+          "本地兜底 · 三条病史各自成栏、互不串栏",
+          f"既往史={soap['past_history'][:10]!r}… · 个人史={soap['personal_history'][:10]!r}… · "
+          f"家族史={soap['family_history'][:10]!r}… —— 以前「既往史」是并进现病史的，"
+          "分开之后学生念到哪个栏目就切进哪一栏")
+
+    # 导出：三条病史各自成节，标题干净（不带卡片上的图标）
+    history_memo = {
+        "id": 3, "record_time": "2026-10-12 10:00:00", "raw_text": "原始语音",
+        "title": "胸痛待查", "category": "问诊记录", "summary": "摘要", "todos": [],
+        "chief_complaint": "胸痛 2 小时", "history": "1. 2 小时前突发胸痛",
+        "past_history": "高血压 8 年，无手术外伤史",
+        "personal_history": "吸烟 30 年，已戒烟 2 年",
+        "family_history": "父亲 60 岁因心梗去世",
+        "physical_exam": "血压 160/95mmHg",
+        "assessment": "考虑急性冠脉综合征可能", "plan": "1. 心电图",
+    }
+    entry = main.format_markdown_entry(history_memo)
+    check(all(f"### {label}" in entry for label in ("既往史", "个人史", "家族史")),
+          "Markdown 导出 · 三条病史各是一个独立的三级标题",
+          "「### 既往史」「### 个人史」「### 家族史」—— 不是一个「### 既往史」里塞三行")
+    check(entry.index("### 主诉") < entry.index("### 现病史")
+          < entry.index("### 既往史") < entry.index("### 个人史")
+          < entry.index("### 家族史") < entry.index("### 体格检查"),
+          "Markdown 导出 · 三条病史按规范顺序排在现病史与体格检查之间",
+          "主诉 → 现病史 → 既往史 → 个人史 → 家族史 → 体格检查 → 诊断思考 → 诊疗计划")
+    check(all(f"### {label}\n\n{history_memo[key]}" in entry
+              for key, label in main.SOAP_SECTIONS if key in
+              ("past_history", "personal_history", "family_history")),
+          "Markdown 导出 · 每栏标题下面就是它自己的内容",
+          "既往史/个人史/家族史 三栏的内容没有互相串到别的标题底下")
+    check(not any(icon in entry for icon in main.SOAP_ICONS.values()),
+          "Markdown 导出 · 病历标题里不印 emoji",
+          "📋/👤/👨‍👩‍👧 只加在网页卡片上；导出的病历文书要保持干净的标题")
+    blank_history = main.format_markdown_entry(
+        {**history_memo, "past_history": "", "personal_history": "", "family_history": ""})
+    check("### 既往史" not in blank_history and "### 个人史" not in blank_history,
+          "Markdown 导出 · 没问到的病史栏目整段省略",
+          "印一个空标题比不印更糟 —— 读者分不清「没问」和「问了没有」")
     check(not any(main.split_spoken_soap("明天下午三点跟客户开会").values()),
           "本地兜底 · 非问诊内容不产出病历",
           "一个栏目名都没提到就返回全空 —— 日常备忘不会长出假病历")
@@ -1758,16 +1825,32 @@ def check_medical_mode(tmp_dir: Path) -> None:
             "title": "问诊记录 · 腹痛", "category": "问诊记录",
             "summary": "腹痛三天", "todos": [],
             "chief_complaint": "腹痛 3 天", "history": "三天前吃火锅后上腹隐痛",
+            "past_history": "胃溃疡病史 5 年，无手术外伤史", "personal_history": "吸烟 20 年，每天 1 包",
+            "family_history": "父亲患高血压",
             "physical_exam": "上腹压痛", "assessment": "急性胃炎", "plan": "血常规 + 急诊胃镜",
         })
         stored = main.fetch_memo(db, memo_id)
         check(all(stored[key] for key in main.SOAP_COLUMNS),
-              "落库 · SOAP 五段原样往返", "写入 → 读回，五段一字不差")
+              "落库 · 八段原样往返", "写入 → 读回，八段一字不差")
+        check(stored["past_history"] == "胃溃疡病史 5 年，无手术外伤史"
+              and stored["personal_history"] == "吸烟 20 年，每天 1 包"
+              and stored["family_history"] == "父亲患高血压",
+              "落库 · 三条病史是三个独立的列",
+              "三栏各存各的，不是一个字段里拿换行分隔 —— "
+              "分开存才谈得上单独编辑、单独导出成独立标题")
         payload = main.memo_to_dict(stored)
         check(payload.get("has_soap") is True
               and [s["key"] for s in payload.get("soap_sections", [])] == list(main.SOAP_COLUMNS),
-              "memo_to_dict · 下发 SOAP 字段与渲染顺序",
+              "memo_to_dict · 下发病历字段与渲染顺序",
               "前端拿到 soap_sections 才知道按什么顺序、用什么标题渲染病历卡片")
+        icons = {s["key"]: s.get("icon") for s in payload.get("soap_sections", [])}
+        check(icons.get("past_history") == "📋" and icons.get("personal_history") == "👤"
+              and icons.get("family_history") == "👨‍👩‍👧"
+              and icons.get("chief_complaint") == "",
+              "memo_to_dict · 三条病史带上卡片图标，其余段是空串",
+              f"既往史/个人史/家族史 = {icons.get('past_history')}/"
+              f"{icons.get('personal_history')}/{icons.get('family_history')}，"
+              "主诉 = ''（前端取不到图标就不留空位）")
 
         updated = main.update_memo(db, memo_id, {
             "chief_complaint": "腹痛 4 天（学生手改）",
@@ -1824,10 +1907,11 @@ def check_medical_mode(tmp_dir: Path) -> None:
         upgraded = main.init_db(legacy_path)
         try:
             columns = {row["name"] for row in upgraded.execute("PRAGMA table_info(memos)")}
-            check(set(main.SOAP_COLUMNS) <= columns, "老库升级 · SOAP 五列自动补齐",
-                  "缺的列用 ALTER TABLE ADD COLUMN 补上（O(1) 元数据操作，不重建表）"
-                  if set(main.SOAP_COLUMNS) <= columns
-                  else f"升级后仍然缺：{sorted(set(main.SOAP_COLUMNS) - columns)}")
+            missing = sorted(set(main.SOAP_COLUMNS) - columns)
+            check(not missing, "老库升级 · 八列（含三条病史）自动补齐",
+                  "缺的列用 ALTER TABLE ADD COLUMN 补上（O(1) 元数据操作，不重建表）；"
+                  "本次升级新增的正是 past_history / personal_history / family_history"
+                  if not missing else f"升级后仍然缺：{missing}")
             row = upgraded.execute("SELECT title, summary, chief_complaint FROM memos").fetchone()
             check(row["title"] == "老卡片" and row["summary"] == "升级前就存在的内容"
                   and (row["chief_complaint"] or "") == "",
@@ -2188,7 +2272,7 @@ def check_web_interface(tmp_dir: Path, conn) -> None:
                                    "体格检查上腹压痛。初步诊断急性胃炎。"
                                    "诊疗计划血常规加急诊胃镜。")
     soap_memo = main.fetch_memo(conn, soap_id)
-    check(main.has_soap(soap_memo), "病历卡片 · 语音内容被整理成 SOAP 五段",
+    check(main.has_soap(soap_memo), "病历卡片 · 语音内容被整理成病历八段",
           f"#{soap_id} 主诉={soap_memo['chief_complaint']!r} "
           f"诊疗计划={soap_memo['plan']!r}")
 
@@ -2534,7 +2618,7 @@ def check_web_interface(tmp_dir: Path, conn) -> None:
     check(main.MERGE_MAX_TOKENS > main.CLINICAL_MAX_TOKENS,
           "合并的输出上限比推演还宽",
           f"merge={main.MERGE_MAX_TOKENS} vs clinical={main.CLINICAL_MAX_TOKENS}："
-          "推演只重写两段，合并要把五段全写一遍；上限给窄了不是「少写点」，"
+          "推演只重写两段，合并要把八段全写一遍；上限给窄了不是「少写点」，"
           "而是 JSON 从中间断掉、整个合并白做")
 
     # --- 按时间先后拼接 ---
@@ -2568,12 +2652,18 @@ def check_web_interface(tmp_dir: Path, conn) -> None:
     check("不要替他补上" in thin and "这正是要你推演的部分" in thin,
           "合并输入把「没问到的」与「要你推演的」分开说",
           "混成一句会让模型连推演一起省掉 —— 实测里它真的会把诊断思考与诊疗计划留空")
+    check("既往史、个人史、家族史" in thin,
+          "三条病史空了 · 算进「他没问到」那一句",
+          "它们必须和主诉、现病史、体查一起出现在「不要替他补上」里；"
+          "落进「这正是要你推演的部分」那句的话，模型会开始凭空编患者的烟酒史和家族史")
     dense = main.build_merge_content([
         {"id": 1, "record_time": "2026-10-01 08:00:00", "raw_text": "",
-         "chief_complaint": "腹痛 3 天", "history": "1. 起病 3 天", "physical_exam": "上腹压痛",
+         "chief_complaint": "腹痛 3 天", "history": "1. 起病 3 天",
+         "past_history": "胃溃疡 5 年", "personal_history": "吸烟 20 年",
+         "family_history": "父亲患高血压", "physical_exam": "上腹压痛",
          "assessment": "已写好的诊断思考", "plan": "已写好的诊疗计划"}])
     check("不要替他补上" not in dense and "这正是要你推演的部分" not in dense,
-          "五段都写了时，那两句叮嘱都不出现",
+          "八段都写了时，那两句叮嘱都不出现",
           "提示词里只该出现与当前材料相符的话，no-op 的叮嘱只会稀释注意力")
 
     # --- 合一次真的：接上假 DeepSeek ---
@@ -2685,7 +2775,7 @@ def check_web_interface(tmp_dir: Path, conn) -> None:
     hollow = client.post("/api/memos/merge", json={"memo_ids": [early_id, late_id]})
     check(hollow.status_code == 502
           and conn.execute("SELECT COUNT(*) FROM memos").fetchone()[0] == count_before,
-          "模型返回了合法 JSON 但五段全空时，也算失败、不落库",
+          "模型返回了合法 JSON 但八段全空时，也算失败、不落库",
           "这种「成功」的假象比报错更糟：页面上会多出一张空卡片，而学生以为合并好了")
     pipeline.client = None
 

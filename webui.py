@@ -384,12 +384,14 @@ def create_app(cfg: Any, conn: sqlite3.Connection, state: Any,
         except Exception as exc:                       # 网络/解析失败都走这里
             return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 502
 
-        # 模型返回了合法 JSON，但五段全空 —— 那就是什么都没熔出来。
+        # 模型返回了合法 JSON，但八个病历字段全空 —— 那就是什么都没熔出来。
         # 这种"成功"的假象比报错更糟：页面上会多出一张空卡片，而学生以为合并好了。
+        # 注意这里的判据是 core.has_soap（派生自 SOAP_SECTIONS），不是写死的五段 ——
+        # 病历字段从五段扩到八段时，这条守卫自动跟着变。
         if not core.has_soap(merged):
             return jsonify({
                 "ok": False,
-                "error": "模型这次没返回任何病历内容（SOAP 五段全空），已放弃本次合并、未入库",
+                "error": "模型这次没返回任何病历内容（主诉到诊疗计划全空），已放弃本次合并、未入库",
             }), 502
 
         try:
