@@ -1,0 +1,51 @@
+# 智能语音备忘录 · 依赖清单
+#
+# 安装：pip install -r requirements.txt
+# Python 3.10+ 均可；本项目已在 Python 3.14.6 上验证通过
+# （torch 2.12.1+cpu / silero-vad 6.2.3 / faster-whisper 1.2.1 / funasr 1.4.16 / numpy 2.5.0）
+#
+# CPU 环境建议改用官方源安装 torch，体积小很多：
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r requirements.txt
+#
+# 只想要最小可用（不装 funasr、接受 whisper 的中文识别率）：
+#   pip install sounddevice numpy silero-vad torch torchaudio faster-whisper pypinyin openai flask
+
+# ---------- 音频采集 ----------
+sounddevice>=0.4.6          # PortAudio 绑定，实时读取麦克风
+numpy>=1.24,<3.0            # 音频缓冲与数组运算
+
+# ---------- VAD 免唤醒断句 ----------
+silero-vad>=5.1.0           # 流式语音活动检测，VADIterator 提供 start/end 事件
+torch>=2.0.0                # silero-vad 的推理后端
+torchaudio>=2.0.0           # silero-vad 工具函数依赖
+
+# ---------- 本地语音识别 ----------
+faster-whisper>=1.0.0       # CTranslate2 加速的 Whisper，完全离线转写
+                            # 首次运行会自动从 HuggingFace 下载模型权重
+                            # 纯 CPU 默认用 base（约 150MB）；更弱可用 tiny
+                            # 医学热词的**解码期提示词**（initial_prompt）只有它支持，
+                            # 换到 funasr 后提示词静默失效，只剩识别后校正兜底。
+pypinyin>=0.49              # 控制词/唤醒词拼音匹配（缺了也能跑，只是错别字认不出来）
+                            # 本项目已在 Python 3.14 上验证有可用轮子，不必降级
+
+# ---------- 中文识别率更高的 ASR 后端（默认走这个）----------
+funasr>=1.1.0               # iic/SenseVoiceSmall，中文专用、CPU 上比 whisper 快且准
+                            # 代价：带入 numba/llvmlite/librosa/modelscope 等（几百 MB），
+                            # 首次运行还要下载约 936MB 模型权重到
+                            # %USERPROFILE%\.cache\modelscope（本机实测约 6 分钟）。
+                            # 装好后 .env 里 ASR_BACKEND=auto 会自动切到它。
+                            # 注意：它没有 initial_prompt 参数，医学热词只靠
+                            # correct_medical_terms 的识别后校正生效。
+
+# ---------- 大模型整理（DeepSeek 走 OpenAI 兼容协议）----------
+openai>=1.30.0              # 仅用作 HTTP 客户端，不依赖其云服务
+
+# ---------- Web 看板 ----------
+flask>=3.0.0                # 只有 `python main.py --web` 需要，纯命令行模式用不到
+
+# ---------- 可选 ----------
+# python-docx>=1.1.0        # 仅 --export-docx 需要：pip install python-docx
+                            # Markdown 导出（默认功能）不需要任何额外依赖
+# python-dotenv>=1.0.0      # 本项目 main.py 内置了极简 .env 解析器，无需安装
+# onnxruntime>=1.17.0       # 想让 silero-vad 走 ONNX 后端（更省 CPU）时再装

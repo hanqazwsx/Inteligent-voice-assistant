@@ -1,0 +1,26 @@
+# 密钥与本地数据 —— 绝不要提交
+.env
+*.db
+*.db-journal
+*.db-wal
+my_memos.md
+memos.md
+memos.docx
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 模型缓存 / 临时音频（如果自行开启了录音留存）
+.cache/
+*.wav
+*.tmp

@@ -1,0 +1,646 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>语音备忘录 · 看板</title>
+<style>
+  :root {
+    --bg: #f4f5f7;
+    --panel: #ffffff;
+    --ink: #1c1f23;
+    --muted: #6b7280;
+    --line: #e5e7eb;
+    --accent: #2f6fed;
+    --idle: #9aa3af;
+    --rec: #e5484d;
+    --busy: #e8a33d;
+    --shadow: 0 1px 2px rgba(16, 24, 40, .06), 0 6px 20px rgba(16, 24, 40, .06);
+    --radius: 14px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a;
+      --panel: #1c1f24;
+      --ink: #e8eaed;
+      --muted: #9aa3af;
+      --line: #2b2f36;
+      --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 6px 20px rgba(0, 0, 0, .35);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 28px 18px 80px; }
+
+  /* ---------- 顶栏 ---------- */
+  header { margin-bottom: 18px; }
+  h1 { font-size: 21px; margin: 0 0 12px; letter-spacing: -.2px; }
+  h1 small { font-weight: 400; color: var(--muted); font-size: 13px; margin-left: 8px; }
+
+  .status {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 14px 16px; box-shadow: var(--shadow);
+  }
+  .dot {
+    width: 11px; height: 11px; border-radius: 50%; flex: none;
+    background: var(--idle); transition: background .25s;
+  }
+  .status[data-state="recording"] .dot { background: var(--rec); animation: pulse 1.1s infinite; }
+  .status[data-state="processing"] .dot { background: var(--busy); animation: pulse 1.1s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: .45; transform: scale(.82); } }
+
+  .status .label { font-weight: 600; font-size: 15px; }
+  .status .detail { color: var(--muted); font-size: 13px; }
+  .status .stats { color: var(--muted); font-size: 13px; text-align: right; }
+  .status .stats b { color: var(--ink); font-weight: 600; }
+  /* 右边这一组（手动控制 + 统计）整体贴右，控制按钮出现时统计不会被挤走 */
+  .status .right {
+    margin-left: auto; display: flex; align-items: center;
+    gap: 14px; flex-wrap: wrap; justify-content: flex-end;
+  }
+
+  /* ---------- 录音中的手动控制（说不出指令词时的双保险）---------- */
+  .live-controls { display: flex; gap: 8px; }
+  .live-controls[hidden] { display: none; }
+  .live-controls button { font-weight: 600; padding: 7px 13px; }
+  .live-controls button:disabled { opacity: .55; cursor: progress; }
+  #btn-finish { background: var(--accent); border-color: var(--accent); color: #fff; }
+  #btn-drop { color: var(--rec); border-color: var(--rec); background: transparent; }
+  #btn-drop:hover { background: var(--rec); color: #fff; }
+
+  .hint {
+    margin-top: 10px; color: var(--muted); font-size: 13px;
+    background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    border-radius: 10px; padding: 10px 14px;
+  }
+  .hint code {
+    background: rgba(127,127,127,.14); border-radius: 5px; padding: 1px 5px;
+    font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
+  /* ---------- 工具条 ---------- */
+  .bar { display: flex; gap: 8px; flex-wrap: wrap; margin: 16px 0 22px; }
+  button, .btn {
+    font: inherit; font-size: 13.5px; cursor: pointer;
+    background: var(--panel); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 9px;
+    padding: 8px 14px; text-decoration: none; display: inline-flex; align-items: center; gap: 6px;
+    transition: border-color .15s, transform .06s;
+  }
+  button:hover, .btn:hover { border-color: var(--accent); }
+  button:active, .btn:active { transform: translateY(1px); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .bar input[type=text] {
+    flex: 1 1 220px; min-width: 180px; font: inherit; font-size: 13.5px;
+    padding: 8px 12px; border: 1px solid var(--line); border-radius: 9px;
+    background: var(--panel); color: var(--ink);
+  }
+  .bar input[type=text]:focus { outline: none; border-color: var(--accent); }
+
+  /* ---------- 卡片 ---------- */
+  .cards { display: flex; flex-direction: column; gap: 14px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 16px 18px; box-shadow: var(--shadow);
+    animation: rise .28s ease both;
+    transition: opacity .26s ease, transform .26s ease;
+  }
+  @keyframes rise { from { opacity: 0; transform: translateY(7px); } to { opacity: 1; transform: none; } }
+  /* 入场动画用 both 填满，会压住 transition（删除时的淡出）；落定后清掉它 */
+  .card.settled { animation: none; }
+  .card.fresh { border-color: var(--accent); }
+  /* 删除：向右淡出，动画结束再摘掉节点 */
+  .card.going { opacity: 0; transform: translateX(18px) scale(.97); }
+
+  .card-top { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
+  .card-actions { display: flex; gap: 2px; margin-left: auto; }
+  .card-actions button {
+    font-size: 12.5px; padding: 4px 10px; color: var(--muted);
+    background: transparent; border-color: transparent;
+  }
+  .card-actions button:hover { color: #fff; background: var(--accent); border-color: var(--accent); }
+  .card-actions .del:hover { background: var(--rec); border-color: var(--rec); }
+  .card-actions button[disabled] { opacity: .45; cursor: default; }
+  .card-actions button[disabled]:hover { color: var(--muted); background: transparent; border-color: transparent; }
+  .time { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+
+  /* ---------- 可直接编辑的字段 ---------- */
+  /* 负外边距是为了让高亮框比文字宽一点，不然文字会跟着挪位 */
+  [contenteditable="true"] {
+    border-radius: 8px; padding: 3px 7px; margin: 0 -7px;
+    outline: none; transition: background .15s, box-shadow .15s;
+  }
+  [contenteditable="true"]:hover { background: rgba(47,111,237,.07); }
+  [contenteditable="true"]:focus {
+    background: rgba(47,111,237,.10);
+    box-shadow: inset 0 0 0 1.5px var(--accent);
+  }
+  /* 改过还没保存 —— 给卡片一道蓝边，提醒"这里存一下" */
+  .card.dirty { border-color: var(--accent); }
+
+  /* ---------- SOAP 病历块 ---------- */
+  .soap { display: flex; flex-direction: column; gap: 11px; margin: 4px 0 10px; }
+  .soap-block { border-left: 3px solid rgba(47,111,237,.32); padding-left: 12px; }
+  .soap-label {
+    display: block; font-size: 12.5px; font-weight: 700; color: var(--accent);
+    letter-spacing: .4px; margin-bottom: 2px;
+  }
+  .soap-body { font-size: 14px; line-height: 1.62; white-space: pre-wrap; }
+  /* 空白栏目的占位提示用 CSS 画，**不能**真的写进 DOM ——
+     否则一保存就把"点击补充"这几个字存进病历里了 */
+  .soap-body:empty::before {
+    content: attr(data-placeholder); color: var(--muted); font-style: italic;
+  }
+  .tag {
+    font-size: 12px; padding: 1px 9px; border-radius: 999px;
+    background: rgba(47,111,237,.12); color: var(--accent); font-weight: 600;
+  }
+  .card h2 { font-size: 16.5px; margin: 2px 0 8px; line-height: 1.45; }
+  .summary { margin: 0 0 10px; color: #3d434b; }
+  @media (prefers-color-scheme: dark) { .summary { color: #c6cad1; } }
+
+  ul.todos { list-style: none; margin: 0 0 10px; padding: 0; }
+  ul.todos li { display: flex; gap: 9px; align-items: flex-start; padding: 3px 0; font-size: 14px; }
+  ul.todos .box { color: var(--accent); flex: none; }
+  ul.todos .due { color: var(--muted); font-size: 12.5px; margin-left: 4px; }
+
+  details { border-top: 1px dashed var(--line); padding-top: 9px; margin-top: 4px; }
+  details summary {
+    cursor: pointer; color: var(--muted); font-size: 13px; list-style: none;
+    display: flex; align-items: center; gap: 6px;
+  }
+  details summary::-webkit-details-marker { display: none; }
+  details summary::before { content: "▸"; transition: transform .15s; display: inline-block; }
+  details[open] summary::before { transform: rotate(90deg); }
+  details p {
+    margin: 8px 0 0; color: var(--muted); font-size: 13.5px;
+    background: rgba(127,127,127,.08); border-radius: 9px; padding: 10px 12px; white-space: pre-wrap;
+  }
+
+  .empty { text-align: center; color: var(--muted); padding: 46px 12px; font-size: 14px; }
+  .empty .big { font-size: 34px; display: block; margin-bottom: 10px; }
+
+  footer { margin-top: 30px; text-align: center; color: var(--muted); font-size: 12px; }
+  #toast {
+    position: fixed; left: 50%; bottom: 26px; transform: translate(-50%, 20px);
+    background: #1f2430; color: #fff; font-size: 13.5px; padding: 10px 18px;
+    border-radius: 10px; opacity: 0; pointer-events: none; transition: all .25s;
+  }
+  #toast.show { opacity: 1; transform: translate(-50%, 0); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>🎙️ 语音备忘录<small>本地识别 · DeepSeek 整理 · 全离线存储</small></h1>
+
+    <div class="status" id="status" data-state="{{ snapshot.state }}">
+      <span class="dot"></span>
+      <span>
+        <div class="label" id="status-label">{{ snapshot.label }}</div>
+        <div class="detail" id="status-detail">{{ snapshot.detail or '麦克风已就绪' }}</div>
+      </span>
+      <span class="right">
+        <span class="live-controls" id="live-controls" hidden>
+          <button id="btn-finish" title="立刻截断当前录音，送去 DeepSeek 整理并落库">⏹️ 结束并整理</button>
+          <button id="btn-drop" title="丢弃当前这段录音：不转写、不整理、不入库">❌ 放弃本条</button>
+        </span>
+        <span class="stats">
+          本次已记录 <b id="count">{{ snapshot.saved_count }}</b> 条<span id="cancelled-wrap"
+            {%- if not snapshot.cancelled_count %} hidden{% endif %}> · 作废 <b id="cancelled">{{ snapshot.cancelled_count }}</b> 条</span><br>
+          更新于 <b id="updated">{{ snapshot.updated_at }}</b>
+        </span>
+      </span>
+    </div>
+
+    <div class="hint">
+      说 <code>{{ snapshot.wake_word }}</code> 开始记录 ·
+      说 <code>{{ segment_end }}</code> 保存并回到待机 ·
+      说 <code>{{ exit_words }}</code> 保存后退出 ·
+      录音途中说 <code>{{ cancel_words }}</code> 直接丢弃本条 ·
+      静音 <code>{{ silence_s }}s</code> 也会自动保存 ·
+      说错了就用状态栏里的
+      <b>⏹️ 结束并整理</b> / <b>❌ 放弃本条</b> 手动收尾
+    </div>
+  </header>
+
+  <div class="bar">
+    <a class="btn primary" href="/api/export?fmt=md">⬇ 导出 Markdown</a>
+    <a class="btn" href="/api/export?fmt=docx">⬇ 导出 Word</a>
+    <input type="text" id="manual" placeholder="也可以直接打字，回车即整理成卡片…">
+    <button id="send">整理</button>
+  </div>
+
+  <div class="cards" id="cards">
+    {% for m in memos %}
+    <article class="card" data-id="{{ m.id }}">
+      <div class="card-top">
+        <span class="time">{{ m.record_time }}</span>
+        {% if m.category %}<span class="tag">{{ m.category }}</span>{% endif %}
+        <span class="card-actions">
+          <button class="act" data-act="save" data-id="{{ m.id }}" title="保存这张卡片上的手工修改（数据库与 my_memos.md 同步更新）">💾 保存修改</button>
+          <button class="act" data-act="regen" data-id="{{ m.id }}" title="先保存修改，再让 DeepSeek 把整张卡片重新生成一遍">🔄 重新润色</button>
+          <button class="del" data-id="{{ m.id }}" title="删除这条记录">🗑️ 删除</button>
+        </span>
+      </div>
+      <h2 contenteditable="true" data-field="title" spellcheck="false">{{ m.title or '未命名记录' }}</h2>
+      {%- if m.has_soap %}
+      <div class="soap">
+        {%- for sec in m.soap_sections %}
+        <div class="soap-block">
+          <span class="soap-label">{{ sec.label }}</span>
+          <div class="soap-body" contenteditable="true" data-field="{{ sec.key }}" data-placeholder="点击补充" spellcheck="false">{{ m[sec.key] }}</div>
+        </div>
+        {%- endfor %}
+      </div>
+      {%- elif m.summary %}
+      <p class="summary" contenteditable="true" data-field="summary" spellcheck="false">{{ m.summary }}</p>
+      {%- endif %}
+      {% if m.todos %}
+      <ul class="todos">
+        {% for t in m.todos %}
+        <li><span class="box">☐</span><span>{{ t.task }}{% if t.due %}<span class="due">截止 {{ t.due }}</span>{% endif %}</span></li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+      {% if m.raw_text %}
+      <details><summary>原始语音文本</summary><p>{{ m.raw_text }}</p></details>
+      {% endif %}
+    </article>
+    {% endfor %}
+  </div>
+
+  {% if not memos %}
+  <div class="empty" id="empty">
+    <span class="big">🗒️</span>
+    还没有备忘录 —— 对着麦克风说一句「{{ snapshot.wake_word }}」，或者在上面输入框里打几个字试试。
+  </div>
+  {% endif %}
+
+  <footer>voice-memo · 状态与卡片通过 SSE 实时推送，页面无需手动刷新</footer>
+</div>
+
+<div id="toast"></div>
+
+<script>
+(function () {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  const statusBox = $("status"), cards = $("cards");
+  const WAKE_WORD = {{ snapshot.wake_word | tojson }};
+
+  function esc(value) {
+    return String(value == null ? "" : value).replace(/[&<>"']/g, (c) => (
+      { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+    ));
+  }
+
+  let toastTimer = null;
+  function toast(msg) {
+    const box = $("toast");
+    box.textContent = msg;
+    box.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => box.classList.remove("show"), 2600);
+  }
+
+  // ---------- 状态 ----------
+  function applyState(data) {
+    statusBox.dataset.state = data.state || "standby";
+    $("status-label").textContent = data.label || "";
+    $("status-detail").textContent = data.detail || "麦克风已就绪";
+    $("count").textContent = data.saved_count != null ? data.saved_count : "0";
+    $("updated").textContent = data.updated_at || "";
+    applyCancelled(data.cancelled_count);
+    applyLiveControls(data.state);
+  }
+
+  // 手动控制按钮只在"正在录音"时露出来 —— 待机/整理中点它没有意义
+  function applyLiveControls(state) {
+    const box = $("live-controls");
+    const live = state === "recording";
+    box.hidden = !live;
+    if (!live) {
+      // 录音结束后把按钮恢复可用，等下一段录音还能按
+      $("btn-finish").disabled = false;
+      $("btn-drop").disabled = false;
+    }
+  }
+
+  async function control(action, btn) {
+    if (action === "cancel" &&
+        !confirm("确定放弃这段录音吗？\n音频会被直接丢掉，不保存、不整理，也没法恢复。")) {
+      return;
+    }
+    const twin = action === "finish" ? $("btn-drop") : $("btn-finish");
+    btn.disabled = twin.disabled = true;
+    try {
+      const resp = await fetch("/api/control/" + action, { method: "POST" });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok || !data.ok) {
+        toast("没生效：" + (data.error || resp.status));
+      } else {
+        toast(action === "finish" ? "已提交，正在整理这段录音…" : "已放弃这条，没有保存");
+      }
+    } catch (err) {
+      toast("请求失败：" + err);
+    } finally {
+      btn.disabled = twin.disabled = false;
+    }
+  }
+
+  $("btn-finish").addEventListener("click", (e) => control("finish", e.currentTarget));
+  $("btn-drop").addEventListener("click", (e) => control("cancel", e.currentTarget));
+
+  function applyCancelled(value) {
+    const n = Number(value) || 0;
+    $("cancelled").textContent = n;
+    $("cancelled-wrap").hidden = n <= 0;
+  }
+
+  // ---------- 卡片 ----------
+  // 这段 DOM 结构必须与服务端 Jinja 渲染出来的**逐字一致**：SSE 推来的卡片走这里，
+  // 首屏卡片走模板，两边长得不一样就会出现"刷新一下样式就变了"的诡异现象。
+  function cardActions(id) {
+    const key = esc(id);
+    return '<span class="card-actions">' +
+      '<button class="act" data-act="save" data-id="' + key + '" title="保存这张卡片上的手工修改（数据库与 my_memos.md 同步更新）">💾 保存修改</button>' +
+      '<button class="act" data-act="regen" data-id="' + key + '" title="先保存修改，再让 DeepSeek 把整张卡片重新生成一遍">🔄 重新润色</button>' +
+      '<button class="del" data-id="' + key + '" title="删除这条记录">🗑️ 删除</button>' +
+      "</span>";
+  }
+
+  function soapBlock(section, body) {
+    return '<div class="soap-block"><span class="soap-label">' + esc(section.label) + "</span>" +
+      '<div class="soap-body" contenteditable="true" spellcheck="false" data-field="' +
+      esc(section.key) + '" data-placeholder="点击补充">' + esc(body || "") + "</div></div>";
+  }
+
+  // 空白栏目也要渲染出来（占位提示由 CSS 画），否则学生想补一段"诊疗计划"却无处可点
+  function cardBody(m) {
+    if (m.has_soap) {
+      const blocks = (m.soap_sections || []).map((s) => soapBlock(s, m[s.key])).join("");
+      return '<div class="soap">' + blocks + "</div>";
+    }
+    if (m.summary) {
+      return '<p class="summary" contenteditable="true" spellcheck="false" data-field="summary">' +
+        esc(m.summary) + "</p>";
+    }
+    return "";
+  }
+
+  function cardNode(m, fresh) {
+    const el = document.createElement("article");
+    el.className = "card" + (fresh ? " fresh" : "");
+    el.dataset.id = m.id;
+
+    const todos = (m.todos || []).map((t) =>
+      '<li><span class="box">☐</span><span>' + esc(t.task) +
+      (t.due ? '<span class="due">截止 ' + esc(t.due) + "</span>" : "") +
+      "</span></li>"
+    ).join("");
+
+    el.innerHTML =
+      '<div class="card-top"><span class="time">' + esc(m.record_time) + "</span>" +
+      (m.category ? '<span class="tag">' + esc(m.category) + "</span>" : "") +
+      cardActions(m.id) + "</div>" +
+      '<h2 contenteditable="true" spellcheck="false" data-field="title">' +
+      esc(m.title || "未命名记录") + "</h2>" +
+      cardBody(m) +
+      (todos ? '<ul class="todos">' + todos + "</ul>" : "") +
+      (m.raw_text
+        ? "<details><summary>原始语音文本</summary><p>" + esc(m.raw_text) + "</p></details>"
+        : "");
+    settle(el);          // 新卡也走一遍入场动画，之后要能淡出
+    return el;
+  }
+
+  // 入场动画是 animation: ... both，会一直压着 transition；动画跑完就摘掉它
+  function settle(node) {
+    setTimeout(() => node.classList.add("settled"), 320);
+  }
+
+  // 新卡片进来是"插入"，改动过的卡片进来是"替换" —— 两者在 SSE 里都是 memo 事件，
+  // 靠"这张卡在不在页面上"来区分。返回 true 表示确实是新卡（调用方据此决定要不要弹提示）。
+  function upsertCard(m) {
+    const existing = cards.querySelector('.card[data-id="' + m.id + '"]');
+    const node = cardNode(m, !existing);
+    if (existing) {
+      existing.replaceWith(node);
+      settle(node);
+      return false;
+    }
+    const empty = $("empty");
+    if (empty) { empty.remove(); }
+    cards.prepend(node);
+    setTimeout(() => node.classList.remove("fresh"), 4000);
+    node.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    return true;
+  }
+
+  // ---------- 卡片上的人工修改 ----------
+  // 取的是 innerText 而不是 textContent：contenteditable 里换行是靠 <div>/<br> 表达的，
+  // textContent 会把它们粘成一行 —— 现病史那几条编号就是这么被粘没的。
+  function collectFields(card) {
+    const fields = {};
+    Array.prototype.forEach.call(card.querySelectorAll("[data-field]"), (node) => {
+      // 顺手把 contenteditable 塞进来的不间断空格（U+00A0）换回普通空格，
+      // 否则存进库里的字看着一样、比对起来不一样
+      fields[node.dataset.field] =
+        (node.innerText || "").replace(/[^\S\n]+/g, " ").trim();
+    });
+    return fields;
+  }
+
+  function currentCard(id) {
+    return cards.querySelector('.card[data-id="' + id + '"]');
+  }
+
+  async function postJson(url, payload) {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok || !data.ok) {
+      throw new Error(data.error || ("HTTP " + resp.status));
+    }
+    return data;
+  }
+
+  async function saveCard(id, btn) {
+    const card = currentCard(id);
+    if (!card) { return; }
+    btn.disabled = true;
+    try {
+      await postJson("/api/memo/" + encodeURIComponent(id) + "/update",
+                     { fields: collectFields(card) });
+      card.classList.remove("dirty");
+      toast("已保存修改");
+    } catch (err) {
+      toast("保存失败：" + err.message);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function regenerateCard(id, btn) {
+    const card = currentCard(id);
+    if (!card) { return; }
+    const original = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "⏳ 润色中…";
+    try {
+      // 页面上的改动跟着一起发过去：润色要基于"学生改过的版本"，而不是数据库里那份旧的。
+      // 这样「保存修改」和「重新润色」就不会互相打架，也不用先点保存再点润色。
+      await postJson("/api/memo/" + encodeURIComponent(id) + "/regenerate",
+                     { fields: collectFields(card) });
+      toast("已重新润色");
+    } catch (err) {
+      toast("润色失败：" + err.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = original;
+    }
+  }
+
+  function bumpCount(delta) {
+    const el = $("count");
+    el.textContent = Math.max(0, (parseInt(el.textContent, 10) || 0) + delta);
+  }
+
+  function ensureEmpty() {
+    if (cards.children.length || $("empty")) { return; }
+    const div = document.createElement("div");
+    div.className = "empty";
+    div.id = "empty";
+    div.innerHTML = '<span class="big">🗒️</span>还没有备忘录 —— 对着麦克风说一句「' +
+      esc(WAKE_WORD) + '」，或者在上面输入框里打几个字试试。';
+    cards.after(div);
+  }
+
+  // 卡片平滑消失。同一张卡只会走一次 —— 点按钮后 SSE 广播紧跟着也会到，
+  // 不拦住的话计数会被减两次（dataset.removing 就是要挡住这个）。
+  function removeCardNode(id, animate) {
+    const node = cards.querySelector('.card[data-id="' + id + '"]');
+    if (!node || node.dataset.removing) { return; }
+    node.dataset.removing = "1";
+    if (!animate) { node.remove(); bumpCount(-1); ensureEmpty(); return; }
+    node.classList.add("going");
+    setTimeout(() => { node.remove(); bumpCount(-1); ensureEmpty(); }, 260);
+  }
+
+  async function deleteCard(id, btn) {
+    if (!confirm("确定删除这条备忘录吗？\n数据库与 my_memos.md 会同步删除，且无法恢复。")) {
+      return;
+    }
+    btn.disabled = true;
+    try {
+      const resp = await fetch("/api/delete/" + encodeURIComponent(id), { method: "DELETE" });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok || !data.ok) {
+        btn.disabled = false;
+        toast("删除失败：" + (data.error || resp.status));
+        return;
+      }
+      removeCardNode(id, true);          // 乐观更新；随后 SSE 会推来权威计数
+      toast("已删除" + (data.title ? "「" + data.title + "」" : "") +
+            "，剩余 " + data.remaining + " 条");
+    } catch (err) {
+      btn.disabled = false;
+      toast("请求失败：" + err);
+    }
+  }
+
+  cards.addEventListener("click", (e) => {
+    const del = e.target.closest("button.del");
+    if (del) { deleteCard(del.dataset.id, del); return; }
+    const act = e.target.closest("button.act");
+    if (!act || act.disabled) { return; }
+    if (act.dataset.act === "save") { saveCard(act.dataset.id, act); }
+    else if (act.dataset.act === "regen") { regenerateCard(act.dataset.id, act); }
+  });
+
+  // 一改就标脏：卡片描一道蓝边，提醒"这里还没存"。重新润色会把改动一起带走，
+  // 所以脏标记只是提示，不是"不存就丢"。
+  cards.addEventListener("input", (e) => {
+    if (!e.target.hasAttribute || !e.target.hasAttribute("data-field")) { return; }
+    const card = e.target.closest(".card");
+    if (card) { card.classList.add("dirty"); }
+  });
+
+  // 改完直接关标签页会丢 —— 拦一下问一句
+  window.addEventListener("beforeunload", (e) => {
+    if (cards.querySelector(".card.dirty")) {
+      e.preventDefault();
+      e.returnValue = "";
+    }
+  });
+
+  // ---------- SSE ----------
+  const stream = new EventSource("/api/stream");
+  stream.onmessage = (evt) => {
+    let data;
+    try { data = JSON.parse(evt.data); } catch (e) { return; }
+    if (data.type === "state") {
+      applyState(data);
+    } else if (data.type === "memo" && data.memo) {
+      // 新卡片和"改过的卡片"共用这一个事件类型，靠页面上有没有这张卡来区分 ——
+      // 只有真的插入了新卡才弹提示，否则每次保存都会跳一句"已生成新卡片"
+      if (upsertCard(data.memo)) {
+        toast("已生成新卡片：" + (data.memo.title || "未命名"));
+      }
+    } else if (data.type === "delete" && data.id != null) {
+      removeCardNode(data.id, true);     // 别的标签页删的，这边同步消失
+    } else if (data.type === "cancel") {
+      applyCancelled(data.cancelled_count);
+      toast("本条已作废，未保存" + (data.keyword ? "（听到「" + data.keyword + "」）" : ""));
+    }
+  };
+  stream.onerror = () => {
+    // EventSource 自带重连；这里只把状态标明，避免用户以为页面卡住了
+    $("status-detail").textContent = "与后端连接中断，正在自动重连…";
+  };
+
+  // ---------- 手动输入 ----------
+  async function submitText() {
+    const input = $("manual");
+    const text = input.value.trim();
+    if (!text) { return; }
+    input.disabled = true;
+    try {
+      const resp = await fetch("/api/text", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: text }),
+      });
+      const data = await resp.json();
+      if (data.ok) { input.value = ""; toast("已整理为第 #" + data.id + " 条"); }
+      else { toast("没成功：" + (data.error || resp.status)); }
+    } catch (err) {
+      toast("请求失败：" + err);
+    } finally {
+      input.disabled = false;
+      input.focus();
+    }
+  }
+  $("send").addEventListener("click", submitText);
+  $("manual").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); submitText(); }
+  });
+
+  // 首屏的卡片是服务端渲染的，同样要等入场动画结束后解除 animation 锁定
+  Array.prototype.forEach.call(cards.querySelectorAll(".card"), settle);
+})();
+</script>
+</body>
+</html>
