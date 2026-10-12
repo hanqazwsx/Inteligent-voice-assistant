@@ -2198,86 +2198,237 @@ def check_web_interface(tmp_dir: Path, conn) -> None:
         ("可编辑区域按字段名标注", 'data-field='),
         ("五个 SOAP 段都渲染出来了", 'class="soap-block"'),
         ("占位提示走 CSS，不会写进记录", ':empty::before'),
-        ("有「重新润色」按钮", "重新润色"),
-        ("前端把修改回写到保存接口", "/update"),
-        ("前端把润色请求发到重新生成接口", "/regenerate"),
+        ("有「💾 保存修改」按钮", "💾 保存修改"),
+        ("有「🔄 智能润色/推演」按钮", "智能润色/推演"),
+        ("前端把修改回写到保存接口", "/api/memos/update/"),
+        ("前端把推演请求发到 re-summarize 接口", "/api/memos/re-summarize/"),
+        ("推演期间卡片上有加载提示", "正在调用 DeepSeek 进行医学推理"),
+        ("前端上报「学生亲手改过哪些字段」", "touched"),
+        ("推演完成后给被保留的段落加标记", "kept"),
         ("手改未保存时离开页面会拦一下", "beforeunload"),
     ):
         check(needle in card_html, f"实时交互 · {label}", f"页面里能找到 {needle!r}")
 
+    # 旧路径还在（老书签、老脚本、浏览器里缓存的旧页面都还在用），新路径也认
+    rules = sorted(str(rule) for rule in app.url_map.iter_rules())
+    for wanted in ("/api/memos/update/<int:memo_id>",
+                   "/api/memos/re-summarize/<int:memo_id>",
+                   "/api/memo/<int:memo_id>/update",
+                   "/api/memo/<int:memo_id>/regenerate"):
+        check(wanted in rules, f"路由已注册 · {wanted}",
+              "新路径是现行的，旧路径保留为别名（同一个视图函数挂两条规则）")
+
     category_before = main.fetch_memo(conn, soap_id)["category"]
-    edited = client.post(f"/api/memo/{soap_id}/update",
+    edited = client.post(f"/api/memos/update/{soap_id}",
                          json={"fields": {"physical_exam": "上腹压痛阳性，无反跳痛",
-                                          "category": "工作"}})
+                                          "category": "工作"},
+                               "touched": ["physical_exam"]})
     payload = edited.get_json() or {}
-    check(edited.status_code == 200 and payload.get("ok"), "POST /update 保存手工修改",
+    check(edited.status_code == 200 and payload.get("ok"), "POST /api/memos/update 保存手工修改",
           f"返回 {payload.get('memo', {}).get('physical_exam')!r}，"
           f"被忽略的字段 {payload.get('ignored')}")
     check(main.fetch_memo(conn, soap_id)["physical_exam"] == "上腹压痛阳性，无反跳痛",
-          "POST /update 真的写进了数据库", "刷新页面/其它标签页拿到的都是改过的版本")
+          "POST /api/memos/update 真的写进了数据库",
+          "刷新页面/其它标签页拿到的都是改过的版本")
     check(payload.get("memo", {}).get("category") == category_before
           and "category" in (payload.get("ignored") or []),
-          "POST /update 拒绝白名单外的字段并如实汇报",
+          "POST /api/memos/update 拒绝白名单外的字段并如实汇报",
           f"category 是枚举，不给手工改（仍是 {category_before!r}）；接口回 200 但把"
           "被忽略的字段列出来，而不是静默丢弃")
+    check(payload.get("markdown_synced") is True
+          and payload.get("saved") == ["physical_exam"],
+          "保存接口如实汇报「存了哪些字段」与「文档同步了没」",
+          f"saved={payload.get('saved')} · markdown_synced={payload.get('markdown_synced')}")
 
-    bad_field = client.post(f"/api/memo/{soap_id}/update", json={"fields": {"没这个字段": "x"}})
-    check(bad_field.status_code == 400, "POST /update 全是非法字段时返回 400",
+    # 旧路径照样能用（前端已切走，但老页面缓存还在）
+    legacy = client.post(f"/api/memo/{soap_id}/update",
+                         json={"fields": {"summary": "走旧路径存的"}})
+    check(legacy.status_code == 200
+          and main.fetch_memo(conn, soap_id)["summary"] == "走旧路径存的",
+          "旧路径 /api/memo/<id>/update 仍然可用",
+          "别名不是摆设：浏览器里缓存的旧页面还在打这个地址")
+
+    bad_field = client.post(f"/api/memos/update/{soap_id}", json={"fields": {"没这个字段": "x"}})
+    check(bad_field.status_code == 400, "POST /api/memos/update 全是非法字段时返回 400",
           f"HTTP {bad_field.status_code}：{(bad_field.get_json() or {}).get('error')!r}")
-    check(client.post("/api/memo/999999/update",
+    check(client.post("/api/memos/update/999999",
                       json={"fields": {"title": "x"}}).status_code == 404,
-          "POST /update 对不存在的卡片返回 404", "不会凭空造一条记录出来")
+          "POST /api/memos/update 对不存在的卡片返回 404", "不会凭空造一条记录出来")
 
-    # 没配 API Key（client=None）时"重新润色"必须明说，而不是假装润色成功
-    no_llm = client.post(f"/api/memo/{soap_id}/regenerate", json={"fields": {}})
-    check(no_llm.status_code == 503, "POST /regenerate 无 LLM 时返回 503",
+    # 没配 API Key（client=None）时"智能推演"必须明说，而不是假装推演成功
+    no_llm = client.post(f"/api/memos/re-summarize/{soap_id}", json={"fields": {}})
+    check(no_llm.status_code == 503, "POST /api/memos/re-summarize 无 LLM 时返回 503",
           f"HTTP {no_llm.status_code}：{(no_llm.get_json() or {}).get('error')!r}")
-    check(client.post("/api/memo/999999/regenerate",
+    check(client.post("/api/memos/re-summarize/999999",
                       json={"fields": {}}).status_code == 404,
-          "POST /regenerate 对不存在的卡片返回 404", "先查 id，再谈润色")
+          "POST /api/memos/re-summarize 对不存在的卡片返回 404", "先查 id，再谈推演")
+
+    # --- 临床推演提示词本身 ---
+    for label, needle in (
+        ("角色是带教医师 / OSCE 考官", "OSCE"),
+        ("要求推初步诊断", "最可能的初步诊断"),
+        ("要求写鉴别诊断的支持点与不支持点", "支持点与不支持点"),
+        ("信息不足时走「待查」而不是猜病名", "待查"),
+        ("要求说明每项检查是为了排除什么", "排除或证实"),
+        ("要求写护理观察与危险信号", "危险信号"),
+        ("不许凭空创造体征", "不许凭空创造临床事实"),
+        ("诊断只许写「待排/待查」口径", "待排"),
+        ("忠于学生的修改", "忠于学生的修改"),
+        ("声明仅用于教学演练", "教学演练"),
+    ):
+        check(needle in main.CLINICAL_PROMPT, f"临床推演提示词 · {label}",
+              f"提示词里能找到 {needle!r}")
+    check(main.CLINICAL_PROMPT != main.SYSTEM_PROMPT
+          and "整理成结构化 JSON" not in main.CLINICAL_PROMPT,
+          "推演用的是另一份提示词，不是首次整理那一份",
+          "首次整理是「书记员」（只许如实记录），推演是「带教老师」（要做临床推理）——"
+          "合成一份必然两头不讨好")
+    check(main.CLINICAL_MAX_TOKENS >= 1500,
+          "推演的输出上限比首次整理宽",
+          f"max_tokens={main.CLINICAL_MAX_TOKENS}：三层鉴别 + 三层计划写全了超过 1000 token，"
+          "沿用 800 会在「诊疗计划」写到一半被截断，而截断的 JSON 直接解析失败")
+
+    # --- 推演输入：全量 JSON + 空段提示 ---
+    full = main.build_regenerate_content(
+        {"title": "问诊记录", "category": "问诊记录", "summary": "摘要",
+         "todos": [{"task": "复查", "due": None}], "raw_text": "原始语音：主诉肚子疼",
+         "chief_complaint": "腹痛 3 天", "history": "", "physical_exam": "",
+         "assessment": "", "plan": ""}, "2026-10-09 09:00:00")
+    check('"chief_complaint": "腹痛 3 天"' in full and '"history": ""' in full,
+          "推演输入带完整 JSON，空段以空串出现",
+          "空段要是直接省掉，模型只会以为这一茬没提；写成 \"\" 它才知道该走「待查」")
+    check("现病史" in full and "字段对照" in full,
+          "推演输入附字段中文对照", "JSON 用英文列名，附一行对照省得模型猜")
+    check(full.find("腹痛 3 天") < full.find("原始语音：主诉肚子疼"),
+          "推演输入 · 学生修订版排在原始语音前面",
+          "模型对「前文优先」很敏感，顺序反了就会拿原始语音盖掉学生刚修正的地方")
+    check("不要替他补上" in full and "问诊得来的客观事实" not in full,
+          "空白的问诊内容旁明确写「不要替他补上」",
+          "只标出哪段是空的还不够 —— 得同时说清空的原因是他没问到，不是让你脑补")
+    check("这正是要你推演的部分" in full,
+          "空白的诊断思考/诊疗计划旁说的是反话：请你推演",
+          "两种空段必须分开说。混成一句（「缺的是他还没问到的内容，不要替他补上」）"
+          "会让模型连推演也一起省掉 —— 实测里它真的会把这两段留空，"
+          "于是整个按钮点下去什么也没发生")
+    no_conclusion = main.build_regenerate_content(
+        {"chief_complaint": "腹痛 3 天", "history": "1. 起病 3 天", "physical_exam": "上腹压痛",
+         "assessment": "已写好的诊断思考", "plan": "已写好的诊疗计划",
+         "raw_text": "原始语音"}, "2026-10-09 09:00:00")
+    check("这正是要你推演的部分" not in no_conclusion,
+          "诊断思考与诊疗计划都写了时，不提「请你推演」那句",
+          "提示词里只该出现与当前卡片状态相符的话，no-op 的叮嘱只会稀释注意力")
+
+    # --- 忠于修改：提示词是请求，代码里另有一层保证 ---
+    fresh = {"chief_complaint": "腹痛 3 天", "physical_exam": "模型改写的体查",
+             "assessment": "模型推演的诊断思考"}
+    restore_from = {"chief_complaint": "腹痛 3 天",                 # 跟模型一样，没什么可还原
+                    "physical_exam": "上腹压痛阳性（学生核对）",     # 被模型改掉了 → 还原
+                    "assessment": "学生自己写的诊断思考草稿",        # 不在保护名单里 → 不动
+                    }
+    restored = main.restore_edited_fields(
+        fresh, restore_from, ["chief_complaint", "physical_exam", "assessment", "todos"])
+    check(restored == ["physical_exam"],
+          "学生亲手写过的段落，模型改不掉",
+          f"还原了 {restored}：主诉两边一模一样就不用动它；诊断思考**故意不还原** ——"
+          "那正是按按钮要推演的两段；todos 不在保护名单里，压根没进循环")
+    check(fresh["physical_exam"] == "上腹压痛阳性（学生核对）"
+          and fresh["assessment"] == "模型推演的诊断思考",
+          "「忠于修改」只保护他写过的那几段，不保护诊断思考与诊疗计划",
+          "学生自己写了诊断思考还按推演，说明他想看老师的思路，覆盖掉才是他要的")
+    annotated = {"chief_complaint": "腹痛 3 天"}
+    check(main.restore_edited_fields(
+              annotated, {"chief_complaint": "腹痛 3 天（患者自述，已核对）"},
+              ["chief_complaint"]) == ["chief_complaint"]
+          and annotated["chief_complaint"] == "腹痛 3 天（患者自述，已核对）",
+          "学生比模型多写的批注不会被抹掉",
+          "模型习惯把描述「精简」掉，可「（患者自述，已核对）」正是学生要留的痕迹")
+    emptied = {"title": "模型给的标题"}
+    check(main.restore_edited_fields(emptied, {"title": "   "}, ["title"]) == []
+          and emptied["title"] == "模型给的标题",
+          "学生把某段清空了，就不再拦着模型填",
+          "清空是一种表态（「这段我不要了」），拿空串去覆盖模型结果反而更糟")
+    check(set(main.PROTECTED_ON_REGENERATE) ==
+          set(main.EDITABLE_FIELDS) - {"assessment", "plan"},
+          "保护名单 = 可编辑字段 - 诊断思考 - 诊疗计划",
+          f"{len(main.PROTECTED_ON_REGENERATE)} 个字段受保护")
 
     # 接上一个假的 DeepSeek：验证"手改过的版本会被带进提示词，并且改动被写回"
     seeing: dict = {}
 
     polished = json.dumps({
-        "title": "问诊记录 · 腹痛（已润色）", "category": "问诊记录",
-        "summary": "学生修订后重写的摘要", "todos": [],
+        "title": "问诊记录 · 腹痛（已推演）", "category": "问诊记录",
+        "summary": "学生修订后重写的摘要", "todos": [{"task": "两周后复查胃镜", "due": None}],
         "chief_complaint": "腹痛 3 天",
         "history": "1. 三天前吃火锅后出现上腹隐痛\n2. 伴恶心呕吐",
-        "physical_exam": "上腹压痛阳性，无反跳痛",
-        "assessment": "急性胃炎可能，需与消化性溃疡鉴别",
-        "plan": "血常规、急诊胃镜；两周后复查",
+        "physical_exam": "上腹压痛，反跳痛可疑",
+        "assessment": "考虑急性胃炎可能；需与消化性溃疡鉴别：支持——餐后上腹痛；不支持——无反跳痛",
+        "plan": "1. 血常规 + 粪隐血：评估有无消化道出血\n2. 急诊胃镜：明确黏膜病变\n3. 两周后复查",
     }, ensure_ascii=False)
 
     def _capture(**kwargs):
+        seeing["system"] = kwargs["messages"][0]["content"]
         seeing["content"] = kwargs["messages"][-1]["content"]
+        seeing["max_tokens"] = kwargs.get("max_tokens")
         return SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=polished))]
         )
 
     pipeline.client = SimpleNamespace(
         chat=SimpleNamespace(completions=SimpleNamespace(create=_capture)))
-    regenerated = client.post(f"/api/memo/{soap_id}/regenerate",
-                              json={"fields": {"assessment": "学生在页面上手改的诊断思考"}})
+    student_exam = "上腹压痛阳性，无反跳痛（学生核对过）"
+    regenerated = client.post(
+        f"/api/memos/re-summarize/{soap_id}",
+        json={"fields": {"physical_exam": student_exam,
+                         "assessment": "学生在页面上手改的诊断思考"},
+              "touched": ["physical_exam", "assessment"]})
     body = regenerated.get_json() or {}
-    check(regenerated.status_code == 200 and body.get("ok"), "POST /regenerate 调模型并写回",
+    check(regenerated.status_code == 200 and body.get("ok"),
+          "POST /api/memos/re-summarize 调模型并写回",
           f"返回 {body.get('error') or body.get('memo', {}).get('title')!r}")
-    check("学生在页面上手改的诊断思考" in seeing.get("content", ""),
-          "POST /regenerate 带上页面上未保存的手改内容",
-          "润色要基于「学生改过的那一版」，而不是库里的旧版 —— 这里不写库地把改动合进内存副本，"
+    check(seeing.get("system") == main.CLINICAL_PROMPT,
+          "推演走的是临床带教提示词",
+          "不是首次整理那份书记员提示词 —— 后者只许如实记录，推不出鉴别诊断")
+    check(seeing.get("max_tokens") == main.CLINICAL_MAX_TOKENS,
+          "推演这次调用放宽了输出上限",
+          f"max_tokens={seeing.get('max_tokens')}")
+    check("学生在页面上手改的诊断思考" in seeing.get("content", "")
+          and "上腹压痛阳性，无反跳痛（学生核对过）" in seeing.get("content", ""),
+          "推演带上页面上未保存的手改内容",
+          "推演要基于「学生改过的那一版」，而不是库里的旧版 —— 这里不写库地把改动合进内存副本，"
           "模型调用失败时它仍显示为未保存，学生不会误以为已经存进去了")
     saved = main.fetch_memo(conn, soap_id)
-    check(saved["history"].startswith("1. 三天前吃火锅")
-          and saved["assessment"] == "急性胃炎可能，需与消化性溃疡鉴别",
-          "POST /regenerate 把模型结果覆盖到 SOAP 字段上",
-          f"现病史={saved['history'][:14]!r}… · 诊断思考={saved['assessment'][:12]!r}…")
+    check(saved["physical_exam"] == student_exam,
+          "体查是学生写的 —— 模型改不掉",
+          f"模型想写「上腹压痛，反跳痛可疑」，被还原成 {saved['physical_exam']!r}")
+    check(body.get("restored") == ["physical_exam"],
+          "接口如实汇报「哪几段是原样保留的」",
+          f"restored={body.get('restored')}；诊断思考不在里面 —— 那两段本来就是推演的产物")
+    check(saved["assessment"].startswith("考虑急性胃炎可能")
+          and saved["history"].startswith("1. 三天前吃火锅")
+          and saved["plan"].startswith("1. 血常规"),
+          "推演结果覆盖到诊断思考与诊疗计划上",
+          f"诊断思考={saved['assessment'][:16]!r}… · 诊疗计划={saved['plan'][:12]!r}…")
     check(saved["raw_text"] == soap_memo["raw_text"]
           and saved["record_time"] == soap_memo["record_time"],
-          "POST /regenerate 不动原始识别原文与录制时间",
-          "润色改的是「怎么表述」，不该改「什么时候说的、原话是什么」")
+          "POST /api/memos/re-summarize 不动原始识别原文与录制时间",
+          "推演改的是「推出什么」，不该改「什么时候说的、原话是什么」")
+    check(body.get("markdown_synced") is True
+          and isinstance(body.get("elapsed_ms"), int),
+          "推演接口汇报文档同步状态与耗时",
+          f"markdown_synced={body.get('markdown_synced')} · {body.get('elapsed_ms')}ms")
     check(markdown_path_contains(Path(cfg.markdown_path), "急诊胃镜"),
-          "修改后 Markdown 自动重刷",
-          f"{Path(cfg.markdown_path).name} 里已经有润色后的诊疗计划")
+          "推演后 Markdown 自动重刷",
+          f"{Path(cfg.markdown_path).name} 里已经有推演后的诊疗计划")
+
+    # 旧页面缓存里没有 touched 这一项 —— 那时宁可"全都当改过"，
+    # 少润色几段只是效果打折，拿模型盖掉学生核对过的描述却是真丢东西。
+    stale = client.post(f"/api/memos/re-summarize/{soap_id}",
+                        json={"fields": {"physical_exam": student_exam}})   # 注意：没有 touched
+    stale_body = stale.get_json() or {}
+    check(student_exam in (stale_body.get("memo", {}).get("physical_exam") or ""),
+          "请求里没有 touched 时保守处理：当作「全都改过」",
+          f"体查仍是 {stale_body.get('memo', {}).get('physical_exam')!r}；"
+          "旧页面报上来的 fields 分不出「改过」和「只是有值」，那就一律保护")
 
     def _explode(**kwargs):
         raise RuntimeError("模拟网关 500：connection reset by peer")
@@ -2285,14 +2436,257 @@ def check_web_interface(tmp_dir: Path, conn) -> None:
     before_failure = main.fetch_memo(conn, soap_id)
     pipeline.client = SimpleNamespace(
         chat=SimpleNamespace(completions=SimpleNamespace(create=_explode)))
-    failing = client.post(f"/api/memo/{soap_id}/regenerate",
+    failing = client.post(f"/api/memos/re-summarize/{soap_id}",
                           json={"fields": {"plan": "这条手改不该被写进去"}})
-    check(failing.status_code == 502, "POST /regenerate 调用失败时返回 502 而不是 500",
+    check(failing.status_code == 502,
+          "POST /api/memos/re-summarize 调用失败时返回 502 而不是 500",
           f"HTTP {failing.status_code}：{(failing.get_json() or {}).get('error')!r}")
     after_failure = main.fetch_memo(conn, soap_id)
     check(after_failure["plan"] == before_failure["plan"],
-          "POST /regenerate 失败时页面上的改动不被写库",
+          "POST /api/memos/re-summarize 失败时页面上的改动不被写库",
           "模型没返回就不落库：手改内容仍显示为「未保存」，学生不会误以为已经存进去了")
+    pipeline.client = None
+
+    # --- 10.11 多选卡片合并 ---
+    # 先备两块"碎片"：时间上前后分开，用来验"必须按时间先后拼接"。
+    early_id = pipeline.handle_text("主诉腹痛三天。三天前吃火锅后上腹隐痛。",
+                                    datetime.now() - timedelta(days=2))
+    late_id = pipeline.handle_text("追问补充：伴恶心呕吐，无黑便。上腹压痛阳性，无反跳痛。",
+                                   datetime.now() - timedelta(days=1))
+    early = main.fetch_memo(conn, early_id)
+    late = main.fetch_memo(conn, late_id)
+    check(early["record_time"] < late["record_time"],
+          "合并测试 · 两块碎片的时间分得开",
+          f"#{early_id} {early['record_time']} vs #{late_id} {late['record_time']}")
+
+    for label, needle in (
+        ("每张卡片有勾选框", 'class="memo-select"'),
+        ("勾选框是 checkbox 类型", 'type="checkbox"'),
+        ("工具栏有「合并选中项」按钮", "🔗 合并选中项并重新整理"),
+        ("合并按钮默认就是灰的", 'id="merge" disabled'),
+        ("页面上有「已选 N 条」计数", 'id="picked"'),
+        ("合并期间显示加载动画", "正在调用 DeepSeek 融会贯通合并病历"),
+        ("前端把合并请求发给新接口", "/api/memos/merge"),
+        ("成功提示按需求原文", "多次记录已成功合并为一张新病例卡片"),
+        ("勾选数决定按钮可用性", "applySelection"),
+        ("勾选状态挂在页面级、不随重绘丢失", "selected.has(key)"),
+        ("新卡片按服务端同款排序插入", "insertCard"),
+        ("合并结果不重复弹提示（认 id 不认时间窗）", "justMerged"),
+        ("二次确认里说明原卡片会保留", "都会保留"),
+    ):
+        check(needle in card_html, f"多选合并 · {label}", f"页面里能找到 {needle!r}")
+    check("/api/memos/merge" in rules, "路由已注册 · /api/memos/merge",
+          "合并走独立接口，不是挂在某张卡片的路径下 —— 它没有「那一张」卡片")
+
+    # 参数校验：宁可在门口拦下来，也别让模型去熔一份缺了一段或者只有一段的病历
+    for label, payload, why in (
+        ("缺 memo_ids", {}, "没有要合并的对象"),
+        ("memo_ids 不是数组", {"memo_ids": 12}, "只认数组，字符串/数字一律挡掉"),
+        ("空数组", {"memo_ids": []}, "空数组什么都不选，等于没点这个按钮"),
+        ("只选了一条", {"memo_ids": [early_id]},
+         "一条的话「合并」就等于「重新润色」，该点的其实是那张卡上的 🔄"),
+        ("同一个 id 报两遍", {"memo_ids": [early_id, early_id]},
+         "去重后只剩一条 —— 重复 id 会让模型以为有两段病程，凭空多出一个时间节点"),
+        ("id 不是数字", {"memo_ids": [early_id, "abc"]}, "得说得清是哪个 id 不合法"),
+        ("一次选太多", {"memo_ids": list(range(1, webui.MERGE_MAX_SOURCES + 2))},
+         "挡的是「全选 50 条」这种手滑：上下文撑爆、账单也涨"),
+    ):
+        resp = client.post("/api/memos/merge", json=payload)
+        check(resp.status_code == 400, f"POST /api/memos/merge 拒绝 · {label}",
+              f"HTTP {resp.status_code}：{(resp.get_json() or {}).get('error')!r} —— {why}")
+
+    resp = client.post("/api/memos/merge", json={"memo_ids": [early_id, 999999]})
+    check(resp.status_code == 404 and (resp.get_json() or {}).get("missing") == [999999],
+          "POST /api/memos/merge 有一条不在就整个 404，不「能查到几条算几条」",
+          f"HTTP {resp.status_code}：{(resp.get_json() or {}).get('error')!r} —— "
+          "少熔一段的病历看着一样完整，学生根本发现不了")
+    check(client.post("/api/memos/merge",
+                      json={"memo_ids": [early_id, late_id]}).status_code == 503,
+          "POST /api/memos/merge 无 LLM 时返回 503", "合并必须有模型，本地规则熔不出来")
+
+    # --- 合并提示词 ---
+    for label, needle in (
+        ("角色是资深临床带教导师", "资深临床带教导师"),
+        ("要求去粗取精", "去粗取精"),
+        ("要求融会贯通", "融会贯通"),
+        ("产出标准 SOAP 病历", "标准 SOAP 临床病历"),
+        ("写明含现病史 1.2.3.4", "1.2.3.4"),
+        ("不许凭空创造体征", "不许凭空创造临床事实"),
+        ("诊断只许写「待排/待查」口径", "待排"),
+        ("前后冲突以更晚那段为准", "更晚"),
+        ("声明仅用于教学演练", "教学演练"),
+    ):
+        check(needle in main.MERGE_PROMPT, f"合并提示词 · {label}",
+              f"提示词里能找到 {needle!r}")
+    check("忠于学生的修改" not in main.MERGE_PROMPT
+          and "忠于学生的修改" in main.CLINICAL_PROMPT,
+          "合并与润色是两份角色不同的提示词",
+          "润色的纪律是「别动学生写下的字」（见 restore_edited_fields 那层代码兜底）；"
+          "合并的纪律恰恰是「该动就动」—— 不去重合成就没有合并的意义，"
+          "所以这一条**绝不能**出现在合并提示词里")
+    for label, spec in (("诊断思考三层要求", main._DIAGNOSIS_SPEC),
+                        ("诊疗计划三层要求", main._PLAN_SPEC),
+                        ("9 字段输出格式", main._OUTPUT_SPEC)):
+        check(spec in main.CLINICAL_PROMPT and spec in main.MERGE_PROMPT,
+              f"两份提示词逐字共用同一段{label}",
+              "抽成常量复用而不是各抄一份：这三段是医学安全的护栏，"
+              "抄成两份迟早改一漏一，而漏掉的那一份，模型就照着漏掉的那版做")
+    check(main.MERGE_MAX_TOKENS > main.CLINICAL_MAX_TOKENS,
+          "合并的输出上限比推演还宽",
+          f"merge={main.MERGE_MAX_TOKENS} vs clinical={main.CLINICAL_MAX_TOKENS}："
+          "推演只重写两段，合并要把五段全写一遍；上限给窄了不是「少写点」，"
+          "而是 JSON 从中间断掉、整个合并白做")
+
+    # --- 按时间先后拼接 ---
+    check(main.memo_sort_key({"record_time": "2026-10-01 08:00:00", "id": 9})
+          < main.memo_sort_key({"record_time": "2026-10-01 09:00:00", "id": 2}),
+          "排序口径 · 先比录制时间",
+          "时间线是主诉里「3 天前」这类表述的锚点，顺序错了模型会把后发生的写成诱因")
+    check(main.memo_sort_key({"record_time": "2026-10-01 08:00:00", "id": 2})
+          < main.memo_sort_key({"record_time": "2026-10-01 08:00:00", "id": 9}),
+          "排序口径 · 同一秒再按 id 破平", "同一秒录的两段按入库先后排才稳定")
+
+    merge_input = main.build_merge_content([late, early])       # 故意倒着传
+    check(merge_input.find(early["record_time"]) < merge_input.find(late["record_time"]),
+          "合并输入按时间先后排列（传进来是乱的也一样）",
+          "函数自己排序，不指望调用方记得先排好")
+    check(f"【第 1 段】" in merge_input and f"（记录 #{early_id}）" in merge_input
+          and f"（记录 #{late_id}）" in merge_input,
+          "合并输入逐段标出录制时间与 id",
+          "模型要能引用「哪一段」的信息，才谈得上「融会贯通」")
+    check((early["raw_text"] or "")[:12] in merge_input
+          and (late["raw_text"] or "")[:12] in merge_input,
+          "合并输入带上了每段的原始语音",
+          "SOAP 是学生整理过的结构，原始语音才是他没加工过的原话 —— 两样都给，"
+          "模型才既有骨架又有细节可以熔")
+
+    # 空段提示沿用「两种空段分开说」的教训（见 build_regenerate_content）
+    thin = main.build_merge_content([
+        {"id": 1, "record_time": "2026-10-01 08:00:00", "raw_text": "",
+         "chief_complaint": "腹痛 3 天", "history": "", "physical_exam": "",
+         "assessment": "", "plan": ""}])
+    check("不要替他补上" in thin and "这正是要你推演的部分" in thin,
+          "合并输入把「没问到的」与「要你推演的」分开说",
+          "混成一句会让模型连推演一起省掉 —— 实测里它真的会把诊断思考与诊疗计划留空")
+    dense = main.build_merge_content([
+        {"id": 1, "record_time": "2026-10-01 08:00:00", "raw_text": "",
+         "chief_complaint": "腹痛 3 天", "history": "1. 起病 3 天", "physical_exam": "上腹压痛",
+         "assessment": "已写好的诊断思考", "plan": "已写好的诊疗计划"}])
+    check("不要替他补上" not in dense and "这正是要你推演的部分" not in dense,
+          "五段都写了时，那两句叮嘱都不出现",
+          "提示词里只该出现与当前材料相符的话，no-op 的叮嘱只会稀释注意力")
+
+    # --- 合一次真的：接上假 DeepSeek ---
+    merge_seeing: dict = {}
+    merged_payload = json.dumps({
+        "title": "急性上腹痛待查", "category": "问诊记录",
+        "summary": "两次记录合并：主诉腹痛 3 天，追问补充恶心呕吐与上腹压痛。",
+        "todos": [{"task": "补做血常规 + 腹部超声", "due": None}],
+        "chief_complaint": "腹痛 3 天",
+        "history": "1. 3 天前吃火锅后出现上腹隐痛\n2. 伴恶心呕吐，无黑便",
+        "physical_exam": "上腹压痛阳性，无反跳痛",
+        "assessment": "考虑急性胃炎可能；需与消化性溃疡鉴别：支持——餐后上腹痛；"
+                      "不支持——无反跳痛",
+        "plan": "1. 血常规 + 粪隐血：评估有无消化道出血\n2. 急诊胃镜：明确黏膜病变\n3. 一周后复诊",
+    }, ensure_ascii=False)
+
+    def _capture_merge(**kwargs):
+        merge_seeing["system"] = kwargs["messages"][0]["content"]
+        merge_seeing["content"] = kwargs["messages"][-1]["content"]
+        merge_seeing["max_tokens"] = kwargs.get("max_tokens")
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=merged_payload))]
+        )
+
+    pipeline.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=_capture_merge)))
+    count_before = conn.execute("SELECT COUNT(*) FROM memos").fetchone()[0]
+    saved_before = state.snapshot()["saved_count"]
+
+    resp = client.post("/api/memos/merge", json={"memo_ids": [late_id, early_id]})
+    body = resp.get_json() or {}
+    merged_id = body.get("id")
+    check(resp.status_code == 200 and body.get("ok") and merged_id,
+          "POST /api/memos/merge 合并成功",
+          f"新卡片 #{merged_id} · 用时 {body.get('elapsed_ms')}ms · "
+          f"错误 {body.get('error')!r}")
+    check(body.get("merged") == [early_id, late_id],
+          "接口按**时间先后**回报合并了哪几段",
+          f"merged={body.get('merged')}：传进去是倒着的，回来的必须是顺的")
+    check(merge_seeing.get("system") == main.MERGE_PROMPT,
+          "合并走的是合并提示词（不是润色那份）",
+          "润色是改一张卡，合并是把几段熔成一份 —— 两份角色提示词")
+    check(merge_seeing.get("max_tokens") == main.MERGE_MAX_TOKENS,
+          "合并这次调用放宽了输出上限", f"max_tokens={merge_seeing.get('max_tokens')}")
+    sent = merge_seeing.get("content", "")
+    check(sent.find(early["record_time"]) < sent.find(late["record_time"]),
+          "发给模型的材料是按时间先后排的",
+          "倒着发的话，模型会把后发生的事写成诱因")
+
+    merged_memo = main.fetch_memo(conn, merged_id)
+    check(merged_memo is not None and main.has_soap(merged_memo),
+          "合并结果真的落库了", f"#{merged_id} 主诉={merged_memo and merged_memo['chief_complaint']!r}")
+    check(merged_memo["record_time"] == late["record_time"],
+          "合并后的录制时间取**最晚**那段",
+          f"{merged_memo['record_time']}：这一条代表的时间跨度是「最早那段 → 最晚那段」，"
+          "落款取最晚一刻 —— 取最早的话，10:00/10:05/10:10 三段熔出来的卡片会写着 10:00 "
+          "并插在自己碎片的中间，看着像排错了")
+    check(merged_memo["plan"].startswith("1. 血常规")
+          and merged_memo["assessment"].startswith("考虑急性胃炎可能"),
+          "合并结果覆盖到诊断思考与诊疗计划上",
+          f"诊断思考={merged_memo['assessment'][:12]!r}…")
+    check(merged_memo["raw_text"] == "",
+          "合并后的记录没有伪造的「原始语音」",
+          "这次合并没有对应录音，编一句「由 #3、#5 合并而来」填进去只会污染"
+          "「原始识别原文」这个字段；来路由源记录本身留着")
+    check(conn.execute("SELECT COUNT(*) FROM memos").fetchone()[0] == count_before + 1,
+          "合并只新增一条记录", "不是把几条改写成一条，是新起一条")
+    check(main.fetch_memo(conn, early_id) is not None
+          and main.fetch_memo(conn, late_id) is not None,
+          "源记录**不删**",
+          "合并不是「整理完就能扔」的操作 —— 学生可能还要回头对照自己当时记的原话；"
+          "真要清理，卡片上本来就有 🗑️ 删除，由他决定")
+    check(state.snapshot()["saved_count"] == saved_before + 1,
+          "合并走 publish_memo：计数 +1 并广播",
+          "新记录才 +1。若误用 publish_update，页面上那句「已记录 N 条」就少算了这张新卡")
+    check(body.get("markdown_synced") is True
+          and markdown_path_contains(Path(cfg.markdown_path), "急性上腹痛待查"),
+          "合并后 Markdown 自动重刷",
+          f"{Path(cfg.markdown_path).name} 里已经有合并出来的那张病历")
+
+    # 排在最前：合并出来的卡片得压在自己那几段碎片**上面**
+    order = [row["id"] for row in conn.execute(
+        "SELECT id FROM memos ORDER BY record_time DESC, id DESC")]
+    check(order.index(merged_id) < min(order.index(early_id), order.index(late_id)),
+          "合并卡片排在自己那几段碎片上面（页面 ORDER BY 实测）",
+          f"页面顺序 {order}：时间不比最晚那段早、id 又最大，所以它必然压在碎片上方，"
+          "「汇总卡 + 底下几段原记录」自然成一组 —— 学生刚记完就合并时，这就是页面顶部")
+
+    # 失败与"假成功"都不能留下垃圾
+    def _explode_merge(**kwargs):
+        raise RuntimeError("模拟网关 500：connection reset by peer")
+
+    count_before = conn.execute("SELECT COUNT(*) FROM memos").fetchone()[0]
+    pipeline.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=_explode_merge)))
+    failing = client.post("/api/memos/merge", json={"memo_ids": [early_id, late_id]})
+    check(failing.status_code == 502
+          and conn.execute("SELECT COUNT(*) FROM memos").fetchone()[0] == count_before,
+          "POST /api/memos/merge 调用失败时返回 502 且不落库",
+          f"HTTP {failing.status_code}：{(failing.get_json() or {}).get('error')!r}")
+
+    empty_payload = json.dumps({"title": "空", "category": "问诊记录", "summary": "",
+                                "todos": [], "chief_complaint": "", "history": "",
+                                "physical_exam": "", "assessment": "", "plan": ""},
+                               ensure_ascii=False)
+    pipeline.client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+        create=lambda **kw: SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content=empty_payload))]))))
+    hollow = client.post("/api/memos/merge", json={"memo_ids": [early_id, late_id]})
+    check(hollow.status_code == 502
+          and conn.execute("SELECT COUNT(*) FROM memos").fetchone()[0] == count_before,
+          "模型返回了合法 JSON 但五段全空时，也算失败、不落库",
+          "这种「成功」的假象比报错更糟：页面上会多出一张空卡片，而学生以为合并好了")
     pipeline.client = None
 
 

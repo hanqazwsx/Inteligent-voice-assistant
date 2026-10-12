@@ -104,6 +104,29 @@
   }
   .bar input[type=text]:focus { outline: none; border-color: var(--accent); }
 
+  /* ---------- 多选合并 ---------- */
+  /* 选中数不够时按钮是灰的，够了两条才高亮 —— 与其点了再报错，不如一开始就点不动 */
+  #merge:disabled { opacity: .5; cursor: default; }
+  #merge:disabled:hover { border-color: var(--line); }
+  #merge:not(:disabled) { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+  #merge.busy { cursor: progress; opacity: 1; }
+  /* 合并期间的小转圈。.busy-veil 里那个是给整张卡片用的，尺寸不一样 */
+  #merge .spin {
+    width: 13px; height: 13px; border-radius: 50%; flex: none;
+    border: 2px solid rgba(47,111,237,.25); border-top-color: var(--accent);
+    animation: spin .8s linear infinite;
+  }
+  .picked-count { color: var(--muted); font-size: 13px; align-self: center; }
+  .picked-count b { color: var(--accent); font-weight: 700; }
+
+  /* 勾选态的卡片描一道蓝边 —— 页面长了也能一眼看出选的是哪几条 */
+  .card.picked { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent), var(--shadow); }
+  .pick { display: inline-flex; align-items: center; cursor: pointer; margin-right: 2px; }
+  .pick input {
+    width: 15px; height: 15px; margin: 0; cursor: pointer;
+    accent-color: var(--accent); vertical-align: middle;
+  }
+
   /* ---------- 卡片 ---------- */
   .cards { display: flex; flex-direction: column; gap: 14px; }
   .card {
@@ -144,6 +167,31 @@
   }
   /* 改过还没保存 —— 给卡片一道蓝边，提醒"这里存一下" */
   .card.dirty { border-color: var(--accent); }
+
+  /* ---------- 智能推演进行中 ---------- */
+  /* 盖住整张卡片，而不是只把按钮变灰：学生这时正盯着卡片等结果，
+     光转个按钮看不出"它在干活、别走开"。 */
+  .card.busy { position: relative; }
+  .busy-veil {
+    position: absolute; inset: 0; z-index: 5;
+    display: flex; flex-direction: column; gap: 11px;
+    align-items: center; justify-content: center;
+    background: rgba(255,255,255,.74); backdrop-filter: blur(1.5px);
+    border-radius: var(--radius);
+    font-size: 13.5px; font-weight: 600; color: var(--accent);
+    animation: veilin .18s ease both;
+  }
+  @media (prefers-color-scheme: dark) { .busy-veil { background: rgba(20,22,26,.72); } }
+  @keyframes veilin { from { opacity: 0; } to { opacity: 1; } }
+  .busy-veil .spin {
+    width: 22px; height: 22px; border-radius: 50%;
+    border: 2.5px solid rgba(47,111,237,.25); border-top-color: var(--accent);
+    animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* 推演时被原样保住的字段（学生自己写的），左边补一道绿条说明"模型没动它" */
+  [data-field].kept { box-shadow: inset 3px 0 0 0 var(--ok, #16a34a); }
 
   /* ---------- SOAP 病历块 ---------- */
   .soap { display: flex; flex-direction: column; gap: 11px; margin: 4px 0 10px; }
@@ -235,19 +283,24 @@
   <div class="bar">
     <a class="btn primary" href="/api/export?fmt=md">⬇ 导出 Markdown</a>
     <a class="btn" href="/api/export?fmt=docx">⬇ 导出 Word</a>
+    <button id="merge" disabled title="至少勾选 2 条记录才能合并">🔗 合并选中项并重新整理</button>
+    <span class="picked-count" id="picked" hidden>已选 <b id="picked-n">0</b> 条</span>
     <input type="text" id="manual" placeholder="也可以直接打字，回车即整理成卡片…">
     <button id="send">整理</button>
   </div>
 
   <div class="cards" id="cards">
     {% for m in memos %}
-    <article class="card" data-id="{{ m.id }}">
+    <article class="card" data-id="{{ m.id }}" data-time="{{ m.record_time }}">
       <div class="card-top">
+        <label class="pick" title="勾选后可与其他记录合并成一张新病历">
+          <input type="checkbox" class="memo-select" data-id="{{ m.id }}">
+        </label>
         <span class="time">{{ m.record_time }}</span>
         {% if m.category %}<span class="tag">{{ m.category }}</span>{% endif %}
         <span class="card-actions">
-          <button class="act" data-act="save" data-id="{{ m.id }}" title="保存这张卡片上的手工修改（数据库与 my_memos.md 同步更新）">💾 保存修改</button>
-          <button class="act" data-act="regen" data-id="{{ m.id }}" title="先保存修改，再让 DeepSeek 把整张卡片重新生成一遍">🔄 重新润色</button>
+          <button class="act" data-act="save" data-id="{{ m.id }}" title="保存这张卡片上的手工修改：数据库与 my_memos.md 同步更新">💾 保存修改</button>
+          <button class="act" data-act="regen" data-id="{{ m.id }}" title="交给 DeepSeek 做临床推演：基于你问到的东西推导诊断思考与诊疗计划（你亲手改过的段落会被原样保留）">🔄 智能润色/推演</button>
           <button class="del" data-id="{{ m.id }}" title="删除这条记录">🗑️ 删除</button>
         </span>
       </div>
@@ -372,8 +425,8 @@
   function cardActions(id) {
     const key = esc(id);
     return '<span class="card-actions">' +
-      '<button class="act" data-act="save" data-id="' + key + '" title="保存这张卡片上的手工修改（数据库与 my_memos.md 同步更新）">💾 保存修改</button>' +
-      '<button class="act" data-act="regen" data-id="' + key + '" title="先保存修改，再让 DeepSeek 把整张卡片重新生成一遍">🔄 重新润色</button>' +
+      '<button class="act" data-act="save" data-id="' + key + '" title="保存这张卡片上的手工修改：数据库与 my_memos.md 同步更新">💾 保存修改</button>' +
+      '<button class="act" data-act="regen" data-id="' + key + '" title="交给 DeepSeek 做临床推演：基于你问到的东西推导诊断思考与诊疗计划（你亲手改过的段落会被原样保留）">🔄 智能润色/推演</button>' +
       '<button class="del" data-id="' + key + '" title="删除这条记录">🗑️ 删除</button>' +
       "</span>";
   }
@@ -401,6 +454,7 @@
     const el = document.createElement("article");
     el.className = "card" + (fresh ? " fresh" : "");
     el.dataset.id = m.id;
+    el.dataset.time = m.record_time || "";   // 插入排序用，和服务端 ORDER BY 同口径
 
     const todos = (m.todos || []).map((t) =>
       '<li><span class="box">☐</span><span>' + esc(t.task) +
@@ -409,7 +463,10 @@
     ).join("");
 
     el.innerHTML =
-      '<div class="card-top"><span class="time">' + esc(m.record_time) + "</span>" +
+      '<div class="card-top">' +
+      '<label class="pick" title="勾选后可与其他记录合并成一张新病历">' +
+      '<input type="checkbox" class="memo-select" data-id="' + esc(m.id) + '"></label>' +
+      '<span class="time">' + esc(m.record_time) + "</span>" +
       (m.category ? '<span class="tag">' + esc(m.category) + "</span>" : "") +
       cardActions(m.id) + "</div>" +
       '<h2 contenteditable="true" spellcheck="false" data-field="title">' +
@@ -419,8 +476,35 @@
       (m.raw_text
         ? "<details><summary>原始语音文本</summary><p>" + esc(m.raw_text) + "</p></details>"
         : "");
+    // 勾选状态从页面级的 selected 里恢复，不是留在 checkbox 上：
+    // SSE 推来一条改动会把整张卡换掉，状态挂在 DOM 上的话勾选就悄悄没了。
+    const key = String(m.id);
+    el.querySelector("input.memo-select").checked = selected.has(key);
+    el.classList.toggle("picked", selected.has(key));
     settle(el);          // 新卡也走一遍入场动画，之后要能淡出
     return el;
+  }
+
+  // ---------- 插入位置 ----------
+  // 和服务端 ``ORDER BY record_time DESC, id DESC`` **同一套排序**。
+  // 不能一律 prepend：合并出来的卡片落款是"最晚那段"的时间，本该压在自己那几段
+  // 碎片上方；无脑插到最顶上，一刷新它又挪回碎片堆里 ——
+  // "刷新一下位置就变了"是比"位置不合心意"更难查的毛病。
+  function rankOf(node) {
+    return [node.dataset.time || "", parseInt(node.dataset.id, 10) || 0];
+  }
+
+  function insertCard(node) {
+    const all = cards.querySelectorAll(".card");
+    const [time, id] = rankOf(node);
+    for (let i = 0; i < all.length; i++) {
+      const [otherTime, otherId] = rankOf(all[i]);
+      if (time > otherTime || (time === otherTime && id > otherId)) {
+        all[i].before(node);            // 比它新（或同一秒但 id 更大）→ 插在它前面
+        return;
+      }
+    }
+    cards.appendChild(node);
   }
 
   // 入场动画是 animation: ... both，会一直压着 transition；动画跑完就摘掉它
@@ -440,10 +524,25 @@
     }
     const empty = $("empty");
     if (empty) { empty.remove(); }
-    cards.prepend(node);
+    insertCard(node);                    // 插到它该在的位置（服务端同款排序）
     setTimeout(() => node.classList.remove("fresh"), 4000);
     node.scrollIntoView({ behavior: "smooth", block: "nearest" });
     return true;
+  }
+
+  // 统一的"把一条 memo 画到页面上"入口：SSE 推来的和接口直接返回的走同一条路，
+  // 免得两条路渲染出略有差别的卡片（这个项目里这种"两边各画一份"的坑踩过）。
+  function applyMemo(m, flash) {
+    const isNew = upsertCard(m);
+    if (flash) {
+      const node = currentCard(m.id);
+      if (node) {
+        node.classList.add("fresh");        // 复用"新卡片"的高亮，表示"这张刚变了"
+        settle(node);
+        setTimeout(() => node.classList.remove("fresh"), 1600);
+      }
+    }
+    return isNew;
   }
 
   // ---------- 卡片上的人工修改 ----------
@@ -460,8 +559,48 @@
     return fields;
   }
 
+  // 本会话里学生**亲手打过字**的字段：卡片 id → Set(字段名)。
+  //
+  // 只报"动过的"而不是"有值的"：后者几乎等于全部字段，等于没有保护。
+  // 这份记录挂在页面级、**刻意不随保存清空** —— 学生的流程是"改 → 保存 → 点推演"，
+  // 保存完就抹掉的话，推演那一步正好失去保护，等于白做。
+  // 也不怕卡片被 SSE 整个换掉：记录不跟着 DOM 走。
+  const editedFields = new Map();
+
+  function markEdited(id, field) {
+    const key = String(id);
+    if (!editedFields.has(key)) { editedFields.set(key, new Set()); }
+    editedFields.get(key).add(field);
+  }
+
+  function touchedFields(id) {
+    return Array.from(editedFields.get(String(id)) || []);
+  }
+
   function currentCard(id) {
     return cards.querySelector('.card[data-id="' + id + '"]');
+  }
+
+  // 推演全程盖住卡片：只把按钮变灰的话，盯着卡片等结果的人看不出它在干活
+  function setCardBusy(card, busy) {
+    if (!card) { return; }
+    card.classList.toggle("busy", busy);
+    card.setAttribute("aria-busy", busy ? "true" : "false");
+    Array.prototype.forEach.call(card.querySelectorAll("button.act"), (b) => {
+      b.disabled = busy;
+    });
+    const veil = card.querySelector(".busy-veil");
+    if (busy) {
+      if (!veil) {
+        const div = document.createElement("div");
+        div.className = "busy-veil";
+        div.innerHTML = '<span class="spin"></span>' +
+          "<span>⏳ 正在调用 DeepSeek 进行医学推理…</span>";
+        card.appendChild(div);
+      }
+    } else if (veil) {
+      veil.remove();
+    }
   }
 
   async function postJson(url, payload) {
@@ -481,37 +620,153 @@
     const card = currentCard(id);
     if (!card) { return; }
     btn.disabled = true;
+    btn.textContent = "⏳ 保存中…";
     try {
-      await postJson("/api/memo/" + encodeURIComponent(id) + "/update",
-                     { fields: collectFields(card) });
+      const data = await postJson(
+        "/api/memos/update/" + encodeURIComponent(id),
+        { fields: collectFields(card), touched: touchedFields(id) });
       card.classList.remove("dirty");
-      toast("已保存修改");
+      const dropped = (data.ignored || []).length;
+      toast("✅ 保存成功" +
+            (data.markdown_synced ? "，已同步 my_memos.md" : "") +
+            (dropped ? "（忽略 " + dropped + " 个不可改字段）" : ""));
     } catch (err) {
       toast("保存失败：" + err.message);
     } finally {
       btn.disabled = false;
+      btn.textContent = "💾 保存修改";
     }
   }
 
   async function regenerateCard(id, btn) {
     const card = currentCard(id);
     if (!card) { return; }
-    const original = btn.textContent;
-    btn.disabled = true;
-    btn.textContent = "⏳ 润色中…";
+    setCardBusy(card, true);
+    btn.textContent = "⏳ 推演中…";
     try {
-      // 页面上的改动跟着一起发过去：润色要基于"学生改过的版本"，而不是数据库里那份旧的。
-      // 这样「保存修改」和「重新润色」就不会互相打架，也不用先点保存再点润色。
-      await postJson("/api/memo/" + encodeURIComponent(id) + "/regenerate",
-                     { fields: collectFields(card) });
-      toast("已重新润色");
+      // 页面上的改动跟着一起发过去：推演要基于"学生改过的那一版"，而不是库里那份旧的。
+      // 这样「保存修改」和「智能润色」不会互相打架，也不必先点保存再点推演。
+      // touched 告诉后端哪几段是他亲笔写的 —— 那几段模型不许改回去。
+      const data = await postJson(
+        "/api/memos/re-summarize/" + encodeURIComponent(id),
+        { fields: collectFields(card), touched: touchedFields(id) });
+      // 直接用返回的数据重画这张卡，不等 SSE —— 两条路都会到，
+      // 谁先到谁画，内容一样，后到的只是把同一张卡再替换一次（幂等）。
+      applyMemo(data.memo, true);
+      (data.restored || []).forEach((name) => {
+        const node = currentCard(id) &&
+          currentCard(id).querySelector('[data-field="' + name + '"]');
+        if (node) { node.classList.add("kept"); }
+      });
+      const kept = (data.restored || []).length;
+      const secs = data.elapsed_ms ? (data.elapsed_ms / 1000).toFixed(1) + "s" : "";
+      toast("✨ 智能润色与诊断推演完成" +
+            (kept ? "（你手写的 " + kept + " 段已原样保留）" : "") +
+            (secs ? " · " + secs : ""));
     } catch (err) {
-      toast("润色失败：" + err.message);
+      toast("推演失败：" + err.message);
     } finally {
-      btn.disabled = false;
-      btn.textContent = original;
+      // 卡片可能已经被重画过了（旧节点已摘掉），所以按 id 重新取一次
+      setCardBusy(currentCard(id) || card, false);
+      btn.textContent = "🔄 智能润色/推演";
     }
   }
+
+  // ---------- 多选合并 ----------
+  // 勾选状态挂在页面级的 Set 上，**不挂在 checkbox 上** —— 卡片被 SSE 整张换掉时
+  // （别的标签页保存/推演过、或本页刚推演完），挂在 DOM 上的勾选会跟着节点一起消失，
+  // 学生勾了五条、中间来一条推送，就得从头再点一遍。
+  const selected = new Set();
+
+  // 本页刚合并出来的卡片 id：SSE 把这张新卡推回来时，别再弹那句通用的"已生成新卡片"。
+  //
+  // 合并这一次会**同时**产生两个提示：SSE 推来的通用提示，和 mergeSelected 自己那句
+  // 「✨ 多次记录已成功合并…」。两个提示共用一个 toast 元素，谁后到谁覆盖谁。
+  // 用"正在合并"这种时间窗来挡是不牢的 —— SSE 帧虽然先于 HTTP 响应发出，
+  // 但浏览器处理两条连接的先后并不保证，万一落在 finally 之后，最后留下的就是
+  // 那句通用提示。改成认 id：响应先到就据此挡掉随后的 SSE，SSE 先到也只是闪一下
+  // 通用提示、随即被**更准确**的那句覆盖 —— 两种情况最后留下的都是对的那句。
+  const justMerged = new Set();
+
+  function applySelection() {
+    const n = selected.size;
+    $("picked").hidden = n === 0;
+    $("picked-n").textContent = n;
+    $("merge").disabled = n < 2;
+    $("merge").title = n < 2
+      ? "至少勾选 2 条记录才能合并（现在 " + n + " 条）；只合并一条的话，" +
+        "该点那张卡片上的「🔄 智能润色/推演」"
+      : "把勾选的 " + n + " 条记录交给 DeepSeek 去粗取精、融会贯通，" +
+        "重新整理成一份完整 SOAP 病历（原卡片保留，不会被删）";
+  }
+
+  function clearSelection() {
+    selected.clear();
+    Array.prototype.forEach.call(cards.querySelectorAll("input.memo-select"), (box) => {
+      box.checked = false;
+      const card = box.closest(".card");
+      if (card) { card.classList.remove("picked"); }
+    });
+    applySelection();
+  }
+
+  function setMergeBusy(busy) {
+    const btn = $("merge");
+    btn.classList.toggle("busy", busy);
+    if (busy) {
+      btn.innerHTML = '<span class="spin"></span>' +
+        "<span>⏳ 正在调用 DeepSeek 融会贯通合并病历...</span>";
+    } else {
+      btn.textContent = "🔗 合并选中项并重新整理";
+    }
+    // 合并期间把复选框也锁上：不然学生在等待时改了勾选，会以为改动能影响到这次请求
+    Array.prototype.forEach.call(cards.querySelectorAll("input.memo-select"), (box) => {
+      box.disabled = busy;
+    });
+    btn.disabled = busy || selected.size < 2;
+  }
+
+  async function mergeSelected(btn) {
+    const ids = Array.from(selected).map((v) => parseInt(v, 10)).filter((v) => v > 0);
+    if (ids.length < 2) { toast("至少勾选 2 条记录才能合并"); return; }
+    if (!confirm("把这 " + ids.length + " 条记录合并成一张新的 SOAP 病历卡片吗？\n\n" +
+                 "· 会调用一次 DeepSeek，把几段记录去粗取精、融会贯通\n" +
+                 "· 生成一张新卡片，原来的 " + ids.length + " 条**都会保留**，不会被删\n" +
+                 "· 需要几秒到十几秒，期间请不要关闭页面")) {
+      return;
+    }
+    setMergeBusy(true);
+    try {
+      const data = await postJson("/api/memos/merge", { memo_ids: ids });
+      justMerged.add(String(data.id));
+      setTimeout(() => justMerged.delete(String(data.id)), 10000);
+      // 直接用返回的数据画卡片，不等 SSE —— 两条路都会到，谁先到谁画
+      applyMemo(data.memo, true);
+      clearSelection();
+      const secs = data.elapsed_ms ? (data.elapsed_ms / 1000).toFixed(1) + "s" : "";
+      toast("✨ 多次记录已成功合并为一张新病例卡片" +
+            (secs ? " · " + secs : "") +
+            (data.markdown_synced ? "，已同步 my_memos.md" : ""));
+    } catch (err) {
+      toast("合并失败：" + err.message);
+    } finally {
+      setMergeBusy(false);
+    }
+  }
+
+  $("merge").addEventListener("click", (e) => mergeSelected(e.currentTarget));
+
+  cards.addEventListener("change", (e) => {
+    const box = e.target.closest && e.target.closest("input.memo-select");
+    if (!box) { return; }
+    const key = String(box.dataset.id);
+    const card = box.closest(".card");
+    if (box.checked) { selected.add(key); } else { selected.delete(key); }
+    if (card) { card.classList.toggle("picked", box.checked); }
+    applySelection();
+  });
+
+  applySelection();        // 首屏：0 条选中 → 按钮灰着
 
   function bumpCount(delta) {
     const el = $("count");
@@ -534,6 +789,9 @@
     const node = cards.querySelector('.card[data-id="' + id + '"]');
     if (!node || node.dataset.removing) { return; }
     node.dataset.removing = "1";
+    // 从选中集合里摘掉：别的标签页把它删了，这边再点合并就会拿一个不存在的 id
+    // 去请求（后端会 404 报"这些卡片已经不在了"），不如当场把它从选中项里去掉
+    if (selected.delete(String(id))) { applySelection(); }
     if (!animate) { node.remove(); bumpCount(-1); ensureEmpty(); return; }
     node.classList.add("going");
     setTimeout(() => { node.remove(); bumpCount(-1); ensureEmpty(); }, 260);
@@ -570,12 +828,15 @@
     else if (act.dataset.act === "regen") { regenerateCard(act.dataset.id, act); }
   });
 
-  // 一改就标脏：卡片描一道蓝边，提醒"这里还没存"。重新润色会把改动一起带走，
+  // 一改就标脏：卡片描一道蓝边，提醒"这里还没存"。智能润色会把改动一起带走，
   // 所以脏标记只是提示，不是"不存就丢"。
+  // 同时把"这一段学生亲手写过"记进 editedFields —— 推演时据此保护它不被模型改回去。
   cards.addEventListener("input", (e) => {
     if (!e.target.hasAttribute || !e.target.hasAttribute("data-field")) { return; }
     const card = e.target.closest(".card");
-    if (card) { card.classList.add("dirty"); }
+    if (!card) { return; }
+    card.classList.add("dirty");
+    markEdited(card.dataset.id, e.target.dataset.field);
   });
 
   // 改完直接关标签页会丢 —— 拦一下问一句
@@ -596,7 +857,8 @@
     } else if (data.type === "memo" && data.memo) {
       // 新卡片和"改过的卡片"共用这一个事件类型，靠页面上有没有这张卡来区分 ——
       // 只有真的插入了新卡才弹提示，否则每次保存都会跳一句"已生成新卡片"
-      if (upsertCard(data.memo)) {
+      // 本页刚合并出来的那张卡更不弹：它的提示由 mergeSelected 自己给（更准确）
+      if (applyMemo(data.memo, false) && !justMerged.has(String(data.memo.id))) {
         toast("已生成新卡片：" + (data.memo.title || "未命名"));
       }
     } else if (data.type === "delete" && data.id != null) {

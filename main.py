@@ -864,6 +864,158 @@ SYSTEM_PROMPT = """你是一个医学生问诊实训的语音病历整理助手�
 _JSON_FENCE_RE = re.compile(r"```(?:json|JSON)?\s*(.*?)```", re.S)
 _TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
 
+#: 「推演类」提示词共用的三段正文 —— 诊断思考的三层要求、诊疗计划的三层要求、输出格式。
+#:
+#: 「智能润色/诊断推演」和「多选合并」是两份**角色不同**的提示词（一份在改一张卡，
+#: 一份要把几段记录熔成一份），但它们对临床推理的要求必须**逐字一致**。
+#: 所以抽成常量复用，而不是各抄一份 —— 这三段是医学安全的护栏，
+#: 抄成两份迟早会改一漏一，而漏掉的那一份，模型就照着漏掉的那版做。
+#:
+#: ⚠️ 拼接一律用 ``+`` 不用 f-string：正文里就有 ``{"task": …}`` 这样的 JSON 示例，
+#: f-string 会把花括号当占位符吃掉，提示词当场坏掉。
+_DIAGNOSIS_SPEC = """## 诊断思考（assessment）要推演出来的东西
+
+按顺序写，每一条都**点明依据**（依据来自哪一段、哪个发现）：
+
+1. **最可能的初步诊断**：结合主诉 + 现病史 + 阳性体征给出，写成"考虑 XX 可能"。
+2. **鉴别诊断思考**：列出 1-3 个需要鉴别的疾病，并**分别说明支持点与不支持点**
+   （"支持：……；不支持：……"）。这是 OSCE 最看重的一环 —— 只下结论不鉴别不给分。
+3. **信息不足时的处理**：如果关键信息（诱因、症状演变、伴随症状、既往史、用药史等）
+   还没问到，明确指出**还缺哪几项**，给出"……待查/待排"的诊断方向，
+   并把该追问的问题一并列出（例如"需追问有无黑便史、有无服用 NSAIDs 史"）。
+   **宁可写"待查"，也不要猜一个具体病名。**"""
+
+_PLAN_SPEC = """## 诊疗计划（plan）要推演出来的东西
+
+按真实临床处置的习惯分三层写：
+
+1. **建议补做/加查的辅助检查**：针对上面的鉴别诊断逐项写清**查它是为了排除或证实什么**
+   （例如"血常规 + 粪隐血：评估有无消化道出血"；"腹部超声：排除胆囊结石、胆管扩张"）。
+2. **治疗与处置建议**：对症处理、是否需留观或收住院、是否需请会诊；
+   诊断未明时写"暂予……，待检查结果回报后调整"。
+3. **护理、观察与随访**：要盯住哪些指标、需要警惕什么危险信号
+   （如"出现呕血、黑便或腹痛加剧立即就诊"）、复诊与随访安排。"""
+
+_OUTPUT_SPEC = """## 输出格式
+
+只输出一个 JSON 对象，不要输出解释、前后缀或 Markdown 代码块。**只填这 9 个字段**：
+
+- title:           不超过 20 字，概括这次问诊。诊断尚未明确时，标题里**不要写死病名**。
+- category:        从 [问诊记录, 健康, 其他] 里选，问诊内容通常就是"问诊记录"。
+- summary:         1-3 句客观摘要：这次问到了什么、推演出什么方向。
+- todos:           数组，每项 {"task": "…", "due": "YYYY-MM-DD HH:MM 或 null"}；
+                   把待追问的问题、待补做的检查、复诊随访都写成待办。没有就返回 []。
+- chief_complaint: 主诉，一句话说清"什么症状 + 多久"。
+- history:         现病史，按时间顺序分条，用 "1. 2. 3." 编号。
+- physical_exam:   体格检查，**只写材料里出现过的体征**。
+- assessment:      诊断思考，按上面三层要求写。
+- plan:            诊疗计划，按上面三层要求写。"""
+
+#: 两份提示词共用的收尾：把"这是教学演练"钉在最后一句 ——
+#: 模型对结尾的指令记得最牢，而这条恰恰是最不该被忽略的一条。
+_TEACHING_TAIL = """最后提醒一句：这份病历用于**教学演练**，你的推演是给学生看的思维示范，
+不是给病人使用的诊疗依据 —— 该说"待查"的地方就说"待查"。
+"""
+
+#: 「智能润色 / 诊断推演」的系统提示词。
+#:
+#: 和首次整理的 ``SYSTEM_PROMPT`` 是**两份不同的角色**，这是刻意的：
+#: 首次整理是「书记员」—— 只如实记录学生问到了什么，一个字都不许多；
+#: 这一次是「带教老师」—— 在学生已经写下的材料上做临床推理。
+#: 合成一份的话，要么首次整理就开始脑补病史，要么推演时畏手畏脚什么都推不出来。
+#:
+#: 提示词里三条不能越过的线：
+#:   1. 症状、体征、检查结果**只许用学生已经写下的**，没问到的不许补；
+#:   2. 推出来的诊断必须**带上依据**，且一律写成"待排/待查"的口径，不许写确诊；
+#:   3. 学生手改过的内容原样保留，价值增量集中在诊断思考与诊疗计划两段。
+#:
+#: ⚠️ 提示词是**请求不是保证** —— "忠于学生的修改"这一条在代码里另有一层兜底，
+#: 见 ``restore_edited_fields``。两条线都要有：提示词让模型别乱改，代码保证改了也白改。
+CLINICAL_PROMPT = (
+    """你是一位资深临床带教医师，同时担任 OSCE（客观结构化临床考试）考官。
+一位医学生刚完成一次问诊，下面是他自己整理好的 SOAP 病历。你的任务不是重新抄一遍，
+而是像带教查房那样，**基于他已经问到的信息做临床推演**，把这份病历补到能拿来讨论的水平。
+
+## 铁的纪律（违反任何一条，这份病历就失去教学价值）
+
+1. **不许凭空创造临床事实。** 主诉、现病史、体格检查里的症状、体征、检查结果，
+   只能来自学生已经写下的内容或后面的原始语音文本。他没问到的就留空或写"未提及"，
+   **绝不为了凑出一个漂亮的诊断而补上"右上腹压痛"这类他没写过的阳性体征**。
+2. **诊断只能是"待排/待查"口径。** 你写的是临床思维演练，不是确诊报告。用
+   "考虑……可能""……待排""需与……鉴别""……待查"这类措辞，不要写"确诊""就是"。
+3. **忠于学生的修改。** 他手动改过的字句（尤其是主诉、现病史、体查里的具体数值与描述）
+   是他自己核对过的，**原样保留** —— 不要改写、不要精简、不要"顺手帮我订正一下"。
+   你的价值增量集中在最后两段：诊断思考与诊疗计划。
+4. 全部用中文，使用规范医学术语，不要出现口语与错别字。
+
+"""
+    + _DIAGNOSIS_SPEC
+    + "\n\n"
+    + _PLAN_SPEC
+    + "\n\n"
+    + _OUTPUT_SPEC
+    + """
+
+补充（这一份是**逐字**润色）：主诉、现病史、体格检查这三段以学生写下的为准，
+最多做错别字与"1. 2. 3."序号规范化，**不许添改任何事实**；
+只有诊断思考与诊疗计划这两段是你要重写的。
+
+"""
+    + _TEACHING_TAIL
+)
+
+#: 「多选合并」的系统提示词。
+#:
+#: 学生分几次记录的碎片（主诉一段、体查一段、追问一段），合成一份完整病历。
+#: 用词按用户原话：**资深临床带教导师**、**去粗取精、融会贯通**、标准 SOAP。
+#:
+#: 和「智能润色」的关键差别在纪律第 2 条：
+#: 润色是"别动学生写下的字"，合并是"该动就动" —— 不去重合成就没有意义。
+#: 但归纳的是**表述**不是**事实**：几段里都没出现过的发现，一个字都不许加。
+MERGE_PROMPT = (
+    """你是一位资深临床带教导师。以下是同一患者几次分段的临床问诊与检查记录，请将它们
+去粗取精、融会贯通，重新归纳整理成一份完整、规范、严密的标准 SOAP 临床病历
+（含主诉、现病史 1.2.3.4、体格检查、智能推演的诊断思考与诊疗计划）。
+
+## 铁的纪律（违反任何一条，这份病历就失去教学价值）
+
+1. **不许凭空创造临床事实。** 所有症状、体征、检查结果、既往史都只能来自下面这几段记录。
+   任何一段里都没出现过的发现，**一个字都不许写** —— 尤其不许为了让病历"完整"而
+   添上没人提过的阳性体征。
+2. **可以去粗取精，但不许改变事实。** 你的任务是归纳与重组：同一件事在几段里说过几遍，
+   只留最完整的那一次；时间线要按先后并成一条；前后说法不一致的，以**更晚**那段为准，
+   并在相应位置注明"（后次记录更正）"。可以改的是**表述**，不是事实。
+3. **诊断只能是"待排/待查"口径。** 你写的是临床思维演练，不是确诊报告。用
+   "考虑……可能""……待排""需与……鉴别""……待查"这类措辞，不要写"确诊""就是"。
+4. **这是同一患者的同一病程，写成一份连贯的病历。** 不要出现"第一段提到……第二段又提到……"
+   这类拆分叙述，也不要罗列"本次合并了 N 条记录" —— 就当面对一位病人、一次问诊来写。
+5. 全部用中文，使用规范医学术语，不要出现口语与错别字。
+
+"""
+    + _DIAGNOSIS_SPEC
+    + "\n\n"
+    + _PLAN_SPEC
+    + "\n\n"
+    + _OUTPUT_SPEC
+    + """
+
+补充（这一份是**归纳合并**）：主诉与现病史按上面"去粗取精"的要求重写 ——
+重合的只留一次、时间线并成一条、按 1. 2. 3. 编号；但事实仍然一个字都不许变。
+
+"""
+    + _TEACHING_TAIL
+)
+
+#: 推演那一次调用的输出上限。SOAP 五段里只有两段要重写，但三层鉴别 + 三层计划
+#: 写全了轻松超过 1000 token；沿用首次整理的 800 会在"诊疗计划"写到一半被截断，
+#: 而截断的 JSON 直接解析失败、整个按钮白点。
+CLINICAL_MAX_TOKENS = 2048
+
+#: 合并那一次调用的输出上限，比推演还宽一档：推演只重写两段，合并要把**五段全写一遍**
+#: （主诉、现病史、体查都得重新归纳），三层鉴别 + 三层计划一样不少。
+#: 上限给窄了的后果不是"少写点"，而是 JSON 从中间断掉、整个合并白做。
+MERGE_MAX_TOKENS = 3072
+
 
 def extract_json_object(text: Optional[str]) -> dict:
     """从模型输出里稳健地抠出 JSON 对象。
@@ -957,13 +1109,19 @@ def call_llm(
     system_prompt: str,
     user_content: str,
     timeout: float = 60.0,
+    max_tokens: int = 800,
 ) -> dict:
-    """调用 DeepSeek（OpenAI 兼容接口）并返回解析后的字典。"""
+    """调用 DeepSeek（OpenAI 兼容接口）并返回解析后的字典。
+
+    ``max_tokens`` 按提示词的长度需要给：首次整理只要一个摘要 + 几条待办，
+    800 足够；「智能润色/诊断推演」要重写整段鉴别与计划，得给到 2000 以上。
+    """
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_content},
     ]
-    kwargs: dict = dict(model=model, messages=messages, temperature=0.2, max_tokens=800, timeout=timeout)
+    kwargs: dict = dict(model=model, messages=messages, temperature=0.2,
+                        max_tokens=max_tokens, timeout=timeout)
     try:
         response = client.chat.completions.create(response_format={"type": "json_object"}, **kwargs)
     except Exception as exc:  # 部分兼容网关不支持 response_format，退回纯提示词约束
@@ -986,25 +1144,89 @@ def call_deepseek(
                     f"录制时间：{record_time}\n原始文本：{raw_text}", timeout)
 
 
-#: 重新润色时给模型看的内容。刻意**把学生手改的版本放在最前面并声明为准**：
-#: 模型对"前文优先"很敏感，顺序反了就会拿原始语音覆盖掉学生刚修正的地方 ——
-#: 那正是他最想保住的东西。
+#: SOAP 五段里属于"问诊得来的客观事实"的那三段 —— 学生没问到就是没有，
+#: 谁都不许替他补。诊断思考与诊疗计划不在其中：那两段是**推演出来的结论**。
+CLINICAL_FACT_FIELDS = ("chief_complaint", "history", "physical_exam")
+
+#: 「智能润色」时，模型**不许改**的字段。
+#:
+#: 提示词里已经写了"忠于学生的修改"，但提示词是请求、不是保证：模型完全可能出于
+#: "帮你规范一下"的好意，把学生核对过的描述改写掉 —— 而那恰恰是他最想保住的东西。
+#: 所以这里在**代码里**再兜一层：本次会话里学生亲手动过的字段，模型返回后一律还原。
+#:
+#: 诊断思考与诊疗计划刻意**不在**这张表里 —— 那两段正是按下这个按钮要推演的东西，
+#: 学生要是自己写了、又要按推演，说明他想看看老师的思路，覆盖掉才是他要的。
+PROTECTED_ON_REGENERATE = tuple(
+    key for key in ("title", "summary") + SOAP_COLUMNS
+    if key not in ("assessment", "plan")
+)
+
+
 def build_regenerate_content(memo: dict, record_time: str) -> str:
-    """拼一段"重新润色"的输入：以手工修订版为准，原始语音仅作参考。"""
-    lines = [f"录制时间：{record_time}", "", "以下是我手工修订过的病历，**以此为准**：", ""]
-    for key, label in SOAP_SECTIONS:
-        body = (memo.get(key) or "").strip()
-        if body:
-            lines += [f"【{label}】", body, ""]
-    if not has_soap(memo):
-        lines += ["【摘要】", (memo.get("summary") or "").strip(), ""]
-    title = (memo.get("title") or "").strip()
-    if title:
-        lines += [f"【标题】{title}", ""]
+    """拼「智能润色 / 诊断推演」的输入：把卡片**当前的全量数据**交给模型。
+
+    刻意把学生改过的那一版放在最前面并声明为准：模型对"前文优先"很敏感，
+    顺序反了就会拿原始语音覆盖掉他刚修正的地方。原始语音留在最后，并降级为"仅作参考"。
+
+    传的是 **JSON 而不是拼好的段落文本**，因为要能看出"哪几段还没写"：
+    空段在 JSON 里以 ``""`` 出现，模型据此才会走"信息不足 → 待查"那条路；
+    拼成段落的话空段直接消失，模型只会以为这一茬你没提。
+    """
+    payload: dict = {
+        "title": (memo.get("title") or "").strip(),
+        "category": (memo.get("category") or "").strip(),
+        "summary": (memo.get("summary") or "").strip(),
+        "todos": memo.get("todos") if isinstance(memo.get("todos"), list) else [],
+    }
+    for key, _label in SOAP_SECTIONS:
+        payload[key] = (memo.get(key) or "").strip()
+
+    legend = " · ".join(f"{key}={label}" for key, label in SOAP_SECTIONS)
+    lines = [
+        f"录制时间：{record_time}",
+        "",
+        "【学生当前卡片的全量数据（JSON）—— 以此为准，空字符串表示这一段他还没写】",
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        "",
+        f"字段对照：{legend}",
+    ]
+    # 空段要**分开说**：问诊内容那几段空了是"他没问到"，得拦着模型别脑补；
+    # 诊断思考/诊疗计划空了恰恰相反 —— 那就是要你推演的东西。
+    # 混在一句里说，模型会连推演一起省掉（实测里这句话会让它把两段也留空）。
+    empty_facts = [label for key, label in SOAP_SECTIONS
+                   if key in CLINICAL_FACT_FIELDS and not payload.get(key)]
+    empty_conclusions = [label for key, label in SOAP_SECTIONS
+                         if key not in CLINICAL_FACT_FIELDS and not payload.get(key)]
+    if empty_facts:
+        lines += ["", f"注意：{ '、'.join(empty_facts) } 目前是空的 —— 那是他还没问到的内容，"
+                      "**不要替他补上**，写'未提及'即可。"]
+    if empty_conclusions:
+        lines += ["", f"{ '、'.join(empty_conclusions) } 目前是空的 —— "
+                      "这正是要你推演的部分，请完整写出来。"]
     raw = " ".join((memo.get("raw_text") or "").split())
     if raw:
-        lines += ["原始语音文本（仅作参考；与上面的修订版冲突时，以修订版为准）：", raw]
+        lines += ["", "原始语音文本（仅作参考；与上面的 JSON 冲突时，以 JSON 为准）：", raw]
     return "\n".join(lines)
+
+
+def restore_edited_fields(fresh: dict, source: dict, edited: Any) -> list:
+    """把模型改掉的、但学生本次**亲手动过**的字段还原回学生那一版。
+
+    ``edited`` 是前端报上来的"学生实际打过字的字段名"（不是"页面上有值的字段"——
+    那几乎等于全部字段，起不到保护作用）。返回被还原的字段名，供界面如实告知。
+
+    只在两种情况下跳过还原：学生那一版是空的（他清空了这一段，交给模型填是合理的），
+    或者模型给的结果跟学生的一样（没什么可还原的）。
+    """
+    restored: list = []
+    for name in edited or ():
+        if name not in PROTECTED_ON_REGENERATE:
+            continue
+        text = str(source.get(name) or "").strip()
+        if text and text != (fresh.get(name) or ""):
+            fresh[name] = text
+            restored.append(name)
+    return restored
 
 
 def regenerate_memo(
@@ -1013,17 +1235,119 @@ def regenerate_memo(
     memo: dict,
     record_time: str,
     timeout: float = 60.0,
+    max_tokens: int = CLINICAL_MAX_TOKENS,
 ) -> dict:
-    """把一张已有的卡片重新交给 DeepSeek 润色，返回新的字段字典。
+    """把一张已有的卡片交给 DeepSeek 做**智能润色与诊断推演**，返回新的字段字典。
 
+    用的是 ``CLINICAL_PROMPT``（带教医师 / OSCE 考官视角），不是首次整理的书记员提示词。
     只拿来**覆盖**内容字段，``record_time`` / ``raw_text`` 保持原样 ——
-    重新润色改的是"怎么表述"，不该动"什么时候说的、原话是什么"。
+    润色改的是"怎么表述、推出什么"，不该动"什么时候说的、原话是什么"。
+
+    这里刻意**不做**"忠于学生的修改"那层还原：那是 ``restore_edited_fields`` 的事，
+    由调用方拿着"学生动过哪些字段"来决定。模型调用与策略分开，两边都能单独测。
     """
-    data = call_llm(client, model, SYSTEM_PROMPT,
-                    build_regenerate_content(memo, record_time), timeout)
+    data = call_llm(client, model, CLINICAL_PROMPT,
+                    build_regenerate_content(memo, record_time), timeout,
+                    max_tokens=max_tokens)
     fresh = normalize_memo(data, memo.get("raw_text") or "", record_time)
     fresh["record_time"] = record_time
     return fresh
+
+
+def memo_sort_key(memo: dict) -> tuple:
+    """**「按时间先后」的唯一口径**：先比录制时间，再比 id 破平。
+
+    合并拼接、导出、合并结果的落点都要"按时间排"，散在各处各写一遍迟早对不上。
+    时间用字符串直接比：``record_time`` 全库统一是 ``YYYY-MM-DD HH:MM:SS``，
+    定长补零，字典序即时间序（真按 ``datetime`` 解析反而要处理各种脏格式）。
+    id 只用来破平 —— 同一秒录的两段，按入库先后排才稳定。
+    """
+    try:
+        key = int(memo.get("id") or 0)
+    except (TypeError, ValueError):
+        key = 0
+    return (str(memo.get("record_time") or ""), key)
+
+
+def build_merge_content(memos: list) -> str:
+    """把几段记录按**时间先后**拼成合并调用的输入。
+
+    每条都标出录制时间与 id，五段 SOAP 只列**有内容的**（空段列出来只是噪音），
+    原始语音也一并给 —— SOAP 是学生整理过的结构，原始语音才是他没加工过的原话，
+    两样都给，模型才既有骨架又有细节可以"融会贯通"。
+
+    结尾照 ``build_regenerate_content`` 的做法，按 ``CLINICAL_FACT_FIELDS`` 把
+    "所有片段里都空着的段"分成两句话：问诊内容类空了是"他没问到，别补"；
+    诊断思考与诊疗计划空了恰恰是"这就是要你推演的部分"。混成一句，
+    模型会连推演一起省掉（实测踩过这个坑）。
+    """
+    ordered = sorted(memos, key=memo_sort_key)
+    lines = [f"以下是同一患者的 {len(ordered)} 段记录，已按时间先后排列："]
+    for index, memo in enumerate(ordered, 1):
+        lines += ["", f"【第 {index} 段】录制时间：{memo.get('record_time') or ''}"
+                      f"（记录 #{memo.get('id')}）"]
+        wrote = False
+        for key, label in SOAP_SECTIONS:
+            body = (memo.get(key) or "").strip()
+            if body:
+                lines.append(f"{label}：{body}")
+                wrote = True
+        if not wrote:
+            summary = " ".join((memo.get("summary") or "").split())
+            if summary:
+                lines.append(f"（这一段还没有 SOAP 内容，摘要：{summary}）")
+        raw = " ".join((memo.get("raw_text") or "").split())
+        if raw:
+            lines.append(f"原始语音：{raw}")
+
+    def _blank(key: str) -> bool:
+        return not any((m.get(key) or "").strip() for m in ordered)
+
+    empty_facts = [label for key, label in SOAP_SECTIONS
+                   if key in CLINICAL_FACT_FIELDS and _blank(key)]
+    empty_conclusions = [label for key, label in SOAP_SECTIONS
+                         if key not in CLINICAL_FACT_FIELDS and _blank(key)]
+    if empty_facts:
+        lines += ["", f"注意：{ '、'.join(empty_facts) } 在所有片段里都没出现过 —— "
+                      "那是学生还没问到的内容，**不要替他补上**，写'未提及'即可。"]
+    if empty_conclusions:
+        lines += ["", f"{ '、'.join(empty_conclusions) } 在所有片段里都是空的 —— "
+                      "这正是要你推演的部分，请完整写出来。"]
+    return "\n".join(lines)
+
+
+def merge_memos(
+    client: Any,
+    model: str,
+    memos: list,
+    timeout: float = 90.0,
+    max_tokens: int = MERGE_MAX_TOKENS,
+) -> dict:
+    """把几段记录交给 DeepSeek **融会贯通**成一份完整病历，返回字段字典。
+
+    新记录的 ``record_time`` 取**最晚那段**的录制时间 —— 两个理由：
+
+    * 语义上，这一条代表的时间跨度是"最早那段 → 最晚那段"，落款取其中的最晚一刻，
+      与"病程记录写到什么时候"的惯例一致（碎片通常只隔几分钟，实际就等于"刚才"）。
+    * 显示上，它在 ``ORDER BY record_time DESC, id DESC`` 下必然排在自己那几段碎片
+      **前面**（时间不比最晚那段早、id 又最大），于是"汇总卡 + 底下几段原记录"
+      自然成一组。取最早那段的话，汇总卡反而会插在**自己碎片的中间** ——
+      10:00/10:05/10:10 三段合并出来一张写着 10:00 的卡片，看着像排错了。
+
+    ``raw_text`` 给空串：这次合并没有对应的录音，"原话是什么"在这一条上并不存在，
+    编一句"由 #3、#5 合并而来"填进去只会污染"原始识别原文"这个字段。
+    出处由源记录本身留着（合并**不删**原卡片），那才是完整的来路。
+
+    调用失败直接抛出去，由调用方决定怎么报 —— 分析（模型调用）与策略（落不落库）
+    分开，两边都能单独测。
+    """
+    ordered = sorted(memos, key=memo_sort_key)
+    if not ordered:
+        raise ValueError("没有可合并的记录")
+    record_time = ordered[-1].get("record_time") or ""
+    data = call_llm(client, model, MERGE_PROMPT, build_merge_content(ordered),
+                    timeout, max_tokens=max_tokens)
+    return normalize_memo(data, "", record_time)
 
 
 def build_llm_client(cfg: Config) -> Optional[Any]:
