@@ -4,7 +4,7 @@
 智能语音备忘录 · 自检脚本
 ==========================
 
-十组离线自检，**不需要麦克风、不需要 API Key、不需要安装重型依赖**：
+十二组离线自检，**不需要麦克风、不需要 API Key、不需要安装重型依赖**：
 
   1. 文件完整性      —— requirements.txt / main.py / webui.py / 模板 / .env.example / README.md
   2. 语法与导入校验  —— AST 语法解析 + 未定义全局名静态扫描 + 模块导入 + 依赖可用性
@@ -15,7 +15,9 @@
   7. 唤醒词与指令     —— 唤醒/分段/作废/退出四类指令、同音字容错、完整状态流转剧本
   8. 拼音模糊匹配     —— 实测的 ASR 错别字（錄音完畢 / 坐着飞 / 錯誤費）照样触发控制词
   9. 音频预处理与后端 —— 降噪/增益的数值行为、funasr 文本清洗、ASR 后端自动选择
- 10. Web 看板与删除   —— 页面/JSON/SSE/导出接口、手动结束/放弃按钮、删卡同步
+ 10. 医学问诊模式     —— 热词提示词 / 识别后校正 / SOAP 八段 / 老库迁移
+ 11. 浏览器原生朗读   —— announce 事件、空内容不发、前端 speechSynthesis 静态断言、旧 TTS 接口已移除
+ 12. Web 看板与删除   —— 页面/JSON/SSE/导出接口、手动结束/放弃按钮、删卡同步
 
 运行::
 
@@ -32,6 +34,7 @@ import importlib
 import importlib.util
 import inspect
 import json
+import re
 import sqlite3
 import sys
 import tempfile
@@ -45,8 +48,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-REQUIRED_FILES = ("requirements.txt", "main.py", "webui.py", "templates/index.html",
-                  ".env.example", "README.md")
+REQUIRED_FILES = ("requirements.txt", "main.py", "webui.py",
+                  "templates/index.html", ".env.example", "README.md")
 CHECKED_SOURCES = ("main.py", "webui.py", "selfcheck.py")
 THIRD_PARTY = {
     "numpy": "音频数组运算",
@@ -58,6 +61,9 @@ THIRD_PARTY = {
     "funasr": "可选的中文专用 ASR 后端（SenseVoiceSmall）",
     "openai": "DeepSeek API 客户端",
 }
+
+#: 后端朗读相关依赖已全部移除；这些名字不该再出现在任何后端源码里。
+REMOVED_TTS_MODULES = ("edge_tts", "pygame", "win32com", "tts_engine")
 
 # --------------------------------------------------------------------------- #
 # 报告收集
@@ -87,7 +93,7 @@ def skip(label: str, detail: str = "") -> None:
 
 
 SECTION_NO = 0
-SECTION_TOTAL = 10
+SECTION_TOTAL = 12
 
 
 def section(title: str) -> None:
@@ -203,23 +209,43 @@ def check_syntax_and_imports() -> None:
         "preprocess_audio", "denoise_spectral", "clean_funasr_text",
     )
     missing = [name for name in expected_api if not hasattr(module, name)]
+    # 朗读事件由 AppState 的方法发出，不是模块级函数
+    if not hasattr(module.AppState, "publish_announce"):
+        missing.append("AppState.publish_announce")
     if missing:
         check(False, "关键接口齐备性", f"缺少：{', '.join(missing)}")
     else:
-        check(True, "关键接口齐备性", f"全部 {len(expected_api)} 个公开接口均已定义")
+        check(True, "关键接口齐备性",
+              f"全部 {len(expected_api)} 个公开接口 + AppState.publish_announce 均已定义")
 
     # --- 延迟导入策略：不装第三方包也能 import ---
     # 只看模块顶层语句；函数体内部的 import 属于"延迟导入"，正是想要的效果
     module_level: list[str] = []
-    for node in ast.parse((PROJECT_ROOT / "main.py").read_text(encoding="utf-8")).body:
-        if isinstance(node, ast.Import):
-            module_level += [alias.name.split(".")[0] for alias in node.names]
-        elif isinstance(node, ast.ImportFrom):
-            module_level.append((node.module or "").split(".")[0])
+    for source_name in ("main.py", "webui.py"):
+        source_path = PROJECT_ROOT / source_name
+        if not source_path.is_file():
+            continue
+        for node in ast.parse(source_path.read_text(encoding="utf-8")).body:
+            if isinstance(node, ast.Import):
+                module_level += [alias.name.split(".")[0] for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                module_level.append((node.module or "").split(".")[0])
     leaked = sorted({name for name in module_level if name in THIRD_PARTY})
     check(not leaked, "延迟导入策略",
           f"模块顶层直接导入了重型依赖：{'、'.join(leaked)}" if leaked
           else "torch / whisper / 音频库全部延迟到函数内导入，可在裸 Python 环境下自检")
+
+    # --- 后端朗读依赖已彻底移除：源码里连名字都不该出现 ---
+    backend_sources = "\n".join(
+        (PROJECT_ROOT / name).read_text(encoding="utf-8")
+        for name in ("main.py", "webui.py")
+        if (PROJECT_ROOT / name).is_file()
+    )
+    stale = [name for name in REMOVED_TTS_MODULES if name in backend_sources]
+    check(not stale, "后端不再依赖 edge-tts / pygame / SAPI",
+          f"仍然出现：{'、'.join(stale)}" if stale
+          else "main.py / webui.py 里没有 edge_tts / pygame / win32com / tts_engine，"
+               "朗读完全交给浏览器；tts_engine.py 也已从交付文件里删除")
 
     # --- 第三方依赖可用性（仅提示，不计入失败）---
     print("\n  第三方依赖可用性（缺失不影响本次离线自检）：", flush=True)
@@ -532,7 +558,7 @@ def check_mock_flow(conn: sqlite3.Connection | None) -> None:
             "--text", "提醒我周五下午两点交周报",
             "--db", str(temp_dir / "cli_check.db"),
             "--md-path", str(temp_dir / "cli_check.md"),
-            "--no-llm",
+            "--no-llm",                   # 自检不该真的调用 DeepSeek
         ])
     except SystemExit as exc:  # --version / --help 之类
         code = int(exc.code or 0)
@@ -999,7 +1025,8 @@ class _SceneStream:
 
 def _run_scene(cfg, events: dict, levels: dict, total_chunks: int, expected: int,
                stop_when_done: bool = True, timeout: float = 30.0, cancels: list | None = None,
-               pokes: list | None = None):
+               pokes: list | None = None, transcriber=None,
+               on_status=None):
     """跑一遍剧本化的状态机，返回 (收到的句子, listener, 假 VAD)。
 
     ``cancels`` 非空时把"语音作废"回调收到的 ``(命中的词, 识别原文)`` 记进去。
@@ -1016,7 +1043,7 @@ def _run_scene(cfg, events: dict, levels: dict, total_chunks: int, expected: int
     utterances: list = []
     done = threading.Event()
     fake_vad = _FakeVADIterator(events)
-    transcriber = _LevelTranscriber()
+    transcriber = transcriber or _LevelTranscriber()
 
     original = main.build_vad_iterator
     main.build_vad_iterator = lambda _vad, _cfg: fake_vad
@@ -1025,6 +1052,7 @@ def _run_scene(cfg, events: dict, levels: dict, total_chunks: int, expected: int
             cfg, None, transcriber=transcriber,
             on_cancel=(lambda keyword, text: cancels.append((keyword, text)))
             if cancels is not None else None,
+            on_status=on_status,
         )
         stream = _SceneStream(np, cfg, levels, total_chunks)
 
@@ -1595,10 +1623,20 @@ def check_audio_and_backend() -> None:
     env_example = (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8")
     missing_env = [key for key in ("ASR_BACKEND", "ASR_FUNASR_MODEL", "AUDIO_PREPROCESS",
                                    "AUDIO_DENOISE", "AUDIO_TARGET_DBFS", "AUDIO_MAX_GAIN_DB",
-                                   "SHORT_END_KEYWORDS") if key not in env_example]
+                                   "SHORT_END_KEYWORDS")
+                   if key not in env_example]
     check(not missing_env, ".env.example 收录了新增的配置项",
           f"缺少 {missing_env} —— 用户照模板配不出来" if missing_env
           else "ASR_BACKEND / AUDIO_* / SHORT_END_KEYWORDS 都在模板里，且不含真实 Key")
+    stale_tts_env = [key for key in ("ENABLE_TTS", "TTS_BACKEND", "TTS_VOICE",
+                                     "TTS_BARGE_IN", "TTS_SAPI_VOLUME")
+                     if key in env_example]
+    check(not stale_tts_env and not any(name.startswith("tts_")
+                                       for name in vars(main.Config(
+                                           beep=False, markdown_path=""))),
+          "不存在遗留的 TTS 配置项",
+          f".env.example 仍列有 {stale_tts_env}" if stale_tts_env
+          else "Config 没有 tts_* 字段，.env.example 也不再让人误以为要配 edge-tts")
     check("sk-" not in env_example.replace("sk-xxxx", ""),
           ".env.example 里没有真实 API Key",
           "模板只放 sk-xxx 占位符，真实的 Key 只在 .env（已被 .gitignore 忽略）")
@@ -1926,7 +1964,159 @@ def check_medical_mode(tmp_dir: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 10. Web 接口与导出
+# 11. 浏览器原生语音朗读（Web Speech API）
+# --------------------------------------------------------------------------- #
+
+
+def check_browser_speech(tmp_dir: Path) -> None:
+    """请求 C 的验收点：后端只推 announce，发声完全交给浏览器。
+
+    这里**不碰声卡**，也验不了"好不好听"；能验证的是两件硬事实：
+    后端确实不再合成/播放音频，以及页面确实调用了 ``speechSynthesis``
+    并具备你要求的语速、音色筛选和即时取消逻辑。
+    """
+    import main
+
+    section("浏览器原生语音朗读（Web Speech API）")
+
+    # --- 11.1 AppState.publish_announce：只推 SSE 事件 ---
+    state = main.AppState(wake_mode=True, wake_word="小医")
+    box = state.broadcaster.subscribe()
+    memo = {
+        "id": 7,
+        "title": "胸痛问诊",
+        "assessment": "考虑急性冠脉综合征，需先排除心肌梗死。",
+        "plan": "立即查心电图与肌钙蛋白，吸氧、建立静脉通路。",
+        "summary": "这行摘要不该被念",
+    }
+    saved_before = state.saved_count
+    emitted = state.publish_announce(memo, "organize")
+    event = box.get(timeout=2)
+    check(emitted and event.get("type") == "announce"
+          and event.get("source") == "organize"
+          and event["memo"]["assessment"] == memo["assessment"]
+          and event["memo"]["plan"] == memo["plan"],
+          "整理完成后推 announce 事件（整张卡片 + 来源）",
+          f"type={event.get('type')!r} · source={event.get('source')!r} · "
+          f"字段 {sorted(event)}")
+    check(not {"audio", "path", "file", "url"} & set(event)
+          and state.saved_count == saved_before,
+          "事件里没有音频文件，也不改保存计数",
+          "后端只转发文字；朗读不会伪装成一次新的保存")
+
+    empty = state.publish_announce({"assessment": "  ", "plan": "\n"}, "organize")
+    try:
+        stray = box.get(timeout=0.2)
+    except Exception:
+        stray = None
+    check(empty is False and stray is None,
+          "诊断思考与诊疗计划都为空时不发事件",
+          "页面不会先念一句「为您分析完毕」然后陷入沉默")
+
+    for source in ("regenerate", "merge"):
+        state.publish_announce(memo, source)
+        try:
+            event = box.get(timeout=2)
+        except Exception:
+            event = {}
+        check(event.get("source") == source,
+              f"{source} 来源原样透传（页面据此选开场白）",
+              f"source={event.get('source')!r}")
+    state.broadcaster.unsubscribe(box)
+
+    # --- 11.2 整理链路真的会调用 on_announce ---
+    conn = main.init_db(tmp_dir / "speech.db")
+    try:
+        cfg = main.Config(beep=False, markdown_path=str(tmp_dir / "speech.md"),
+                          db_path=str(tmp_dir / "speech.db"))
+        calls: list = []
+        pipeline = main.MemoPipeline(
+            cfg, conn, None, None,
+            on_announce=lambda card, source: calls.append(
+                (card.get("id"), source, card.get("assessment"), card.get("plan"))
+            ) or True,
+        )
+        memo_id = pipeline.handle_text("患者胸痛三天，考虑心绞痛，建议查心电图")
+        check(memo_id is not None and calls and calls[-1][0] == memo_id
+              and calls[-1][1] == "organize",
+              "文本整理落库后自动调用 on_announce",
+              f"#{memo_id} · 回调记录 {calls}")
+
+        no_cb = main.MemoPipeline(cfg, conn, None, None)
+        check(no_cb.announce({"assessment": "有内容"}) is False,
+              "没挂回调时安静返回 False（命令行模式照样可用）",
+              "不会因为没人听就抛异常")
+
+        def boom(_card, _source):
+            raise RuntimeError("SSE 断了")
+
+        broken = main.MemoPipeline(cfg, conn, None, None, on_announce=boom)
+        check(broken.announce({"assessment": "有内容"}) is False,
+              "推送失败只记日志，绝不影响已经落库的卡片",
+              "memorize/保存的成功与否不依赖浏览器是否在线")
+    finally:
+        conn.close()
+
+    # --- 11.3 前端：确实用 speechSynthesis，参数与打断符合要求 ---
+    html = (PROJECT_ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+    required = {
+        "window.speechSynthesis": "调用浏览器原生语音",
+        "SpeechSynthesisUtterance": "构造朗读片段",
+        "SPEAK_RATE = 0.95": "语速 0.95",
+        "SPEAK_PITCH = 1.0": "音调 1.0",
+        "SECTION_PAUSE_MS = 520": "模块间停顿",
+        "SENTENCE_PAUSE_MS = 180": "句间停顿",
+        "synth.cancel()": "立即取消语音队列",
+        "speechToken": "世代号，迟到回调作废",
+        "voiceScore": "中文音色打分",
+        "pickVoice": "自动挑中文发音人",
+        "natural|neural|online": "优先自然/神经音色",
+        "localStorage": "记住自动朗读开关",
+        "visibilityState": "后台标签页不自动出声",
+        'data.type === "announce"': "接收后端 announce 事件",
+        'data-act="speak"': "卡片朗读按钮",
+        'data-act="stop-tts"': "停止朗读按钮",
+        "朗读分析": "按钮文案",
+        "停止朗读": "停止按钮文案",
+        "自动语音朗读结果": "工具栏自动朗读开关",
+    }
+    missing = [f"{token}（{why}）" for token, why in required.items() if token not in html]
+    check(not missing, "页面使用 Web Speech API，语速/音调/音色筛选齐备",
+          f"缺少：{'、'.join(missing)}" if missing
+          else f"rate=0.95 · pitch=1.0 · 中文音色打分 · {len(required)} 个关键片段全部命中")
+
+    check("utter.rate = SPEAK_RATE" in html and "utter.pitch = SPEAK_PITCH" in html,
+          "rate / pitch 真的写进每个 utterance",
+          "常量定义了却没用上，听感会退回浏览器默认值")
+
+    check('speechActive && speakingCardId === key' in html
+          and "cancelSpeech(false)" in html,
+          "朗读中再点同一张卡片的 🔊 会立即停止",
+          "同一个按钮承担「开始 / 停止」两种语义")
+
+    check('baseState === "standby"' in html
+          and "正在朗读诊断与计划" in html,
+          "朗读态只覆盖后端的待机态，不搅乱录音/整理指示",
+          "页面自己维护紫色朗读态；后端状态机仍是 standby/recording/processing 三态")
+
+    # --- 11.4 旧的后端朗读路径确已移除 ---
+    legacy = [token for token in ("/api/tts", "/speak",
+                                  "tts_enabled", "tts_available", "TTS_BACKEND")
+              if token in html]
+    check(not legacy, "页面不再调用任何后端朗读接口",
+          f"模板里仍有：{'、'.join(legacy)}" if legacy
+          else "没有 /api/tts*、没有 /speak、没有 tts_* 字段，朗读不再需要后端参与")
+
+    stale_backend = [name for name in ("build_tts_engine", "VoiceAnnouncer",
+                                      "STATE_PLAYING", "DEFAULT_TTS_SNAPSHOT")
+                     if hasattr(main, name)]
+    check(not stale_backend, "后端朗读类与常量已彻底删除",
+          f"仍然存在：{stale_backend}" if stale_backend
+          else "main.py 里没有 VoiceAnnouncer / build_tts_engine / playing 状态残留")
+
+
+# --------------------------------------------------------------------------- #
+# 11. Web 接口与导出
 # --------------------------------------------------------------------------- #
 
 
@@ -2023,6 +2213,97 @@ def check_web_interface(tmp_dir: Path, conn) -> None:
     check(client.post("/api/text", json={"text": "   "}).status_code == 400,
           "POST /api/text 拒绝空内容", "空文本返回 400，不会写出空卡片")
 
+    # --- 语音朗读：后端只推 announce，页面用 Web Speech 开口 ---
+    check(all(token in html for token in (
+              'id="tts-toggle"', 'id="btn-stop-tts"', 'id="speak-controls"',
+              'data-act="speak"', 'data-act="stop-tts"',
+              "朗读分析", "停止朗读", "自动语音朗读结果",
+              "window.speechSynthesis")),
+          "页面包含朗读 / 停止按钮与自动朗读开关",
+          "每张卡片有 🔊 朗读分析，顶栏有 ⏹️ 停止朗读，工具栏有自动朗读复选框")
+
+    state_json = client.get("/api/state").get_json()
+    check(not any(key.startswith("tts_") for key in state_json),
+          "状态快照里不再有 tts_* 字段",
+          f"字段：{sorted(state_json)}")
+
+    legacy_routes = (
+        (f"/api/memos/{memo_id}/speak", client.post),
+        ("/api/tts", lambda path: client.post(path, json={"enabled": True})),
+        ("/api/tts/stop", client.post),
+    )
+    gone = [(path, resp.status_code) for path, call in legacy_routes
+            for resp in (call(path),) if resp.status_code not in (404, 405)]
+    check(not gone, "旧的朗读接口已全部移除",
+          f"仍然可访问：{gone}" if gone
+          else "/api/memos/<id>/speak、/api/tts、/api/tts/stop 均返回 404/405")
+
+    # 润色 / 合并完成后，后端应推一条 announce 事件；这里用假模型避开网络，
+    # 只验"接口成功之后有没有把新内容交给页面去念"。
+    import queue as _queue
+
+    def _next_event(box, wanted: str, timeout: float = 2.0):
+        seen: list = []
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                event = box.get(timeout=max(0.01, deadline - time.monotonic()))
+            except _queue.Empty:
+                break
+            seen.append(event.get("type"))
+            if event.get("type") == wanted:
+                return event, seen
+        return None, seen
+
+    pipeline.client = object()                 # 只用于通过"有没有 DeepSeek"的闸门
+    saved_regenerate = main.regenerate_memo
+    saved_merge = main.merge_memos
+
+    def fake_regenerate(_client, _model, memo, _record_time):
+        fresh = dict(memo)
+        fresh["assessment"] = "新的诊断思考：考虑心绞痛。"
+        fresh["plan"] = "新的诊疗计划：查心电图与肌钙蛋白。"
+        return fresh
+
+    def fake_merge(_client, _model, sources):
+        merged = dict(sources[0])
+        merged.pop("id", None)
+        merged["title"] = "合并后的病历"
+        merged["assessment"] = "合并诊断：考虑稳定型心绞痛。"
+        merged["plan"] = "合并计划：完善检查后门诊随访。"
+        return merged
+
+    try:
+        main.regenerate_memo = fake_regenerate
+        box = state.broadcaster.subscribe()
+        resp = client.post(f"/api/memos/re-summarize/{memo_id}", json={})
+        event, seen = _next_event(box, "announce")
+        check(resp.status_code == 200 and event is not None
+              and event.get("source") == "regenerate"
+              and "心绞痛" in (event.get("memo", {}).get("assessment") or ""),
+              "智能润色成功后推 announce（source=regenerate）",
+              f"HTTP {resp.status_code} · 事件序列 {seen}")
+        state.broadcaster.unsubscribe(box)
+    finally:
+        main.regenerate_memo = saved_regenerate
+
+    merge_source = pipeline.handle_text("补充记录：腹痛三天，餐后加重，无反酸")
+    try:
+        main.merge_memos = fake_merge
+        box = state.broadcaster.subscribe()
+        resp = client.post("/api/memos/merge",
+                           json={"memo_ids": [memo_id, merge_source]})
+        event, seen = _next_event(box, "announce")
+        check(resp.status_code == 200 and event is not None
+              and event.get("source") == "merge"
+              and "合并计划" in (event.get("memo", {}).get("plan") or ""),
+              "合并成功后推 announce（source=merge）",
+              f"HTTP {resp.status_code} · 事件序列 {seen}")
+        state.broadcaster.unsubscribe(box)
+    finally:
+        main.merge_memos = saved_merge
+        pipeline.client = None
+
     # --- 10.6 导出下载 ---
     md = client.get("/api/export?fmt=md")
     body = md.get_data(as_text=True)
@@ -2031,7 +2312,9 @@ def check_web_interface(tmp_dir: Path, conn) -> None:
     check(md.status_code == 200 and "attachment" in headers.get("content-disposition", ""),
           "GET /api/export?fmt=md 是下载而不是内嵌",
           f"Content-Disposition = {headers.get('content-disposition', '')}")
-    check(body.count("## ") == rows and "共 %d 条记录" % rows in body,
+    # 只数二级标题：SOAP 段是 ``### 主诉``，直接用 "## " 子串会把它们也算进去
+    check(len(re.findall(r"(?m)^## ", body)) == rows
+          and "共 %d 条记录" % rows in body,
           "Markdown 导出内容完整",
           f"{rows} 条记录各一个二级标题，头部带统计信息")
     check("<" not in body and body.startswith("# "), "Markdown 导出干净",
@@ -2075,7 +2358,8 @@ def check_web_interface(tmp_dir: Path, conn) -> None:
     check(left == 0 and rows_after == rows_before - 1, "删除后数据库里没有这条记录",
           f"id={victim} 命中 {left} 行，总行数 {rows_before} → {rows_after}")
     md_after = md_path.read_text(encoding="utf-8")
-    check("7788" not in md_after and md_after.count("## ") == rows_after,
+    check("7788" not in md_after
+          and len(re.findall(r"(?m)^## ", md_after)) == rows_after,
           "删除后 my_memos.md 与数据库重新对齐",
           f"被删的条目（含原始文本）已从文档里消失，"
           f"文档 {md_after.count('## ')} 条 = 数据库 {rows_after} 行")
@@ -2839,6 +3123,7 @@ def main() -> int:
             check_pinyin_matching()
             check_audio_and_backend()
             check_medical_mode(Path(tmp))
+            check_browser_speech(Path(tmp))
             check_web_interface(Path(tmp), conn)
         finally:
             if conn is not None:

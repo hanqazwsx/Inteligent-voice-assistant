@@ -15,6 +15,9 @@
     --idle: #9aa3af;
     --rec: #e5484d;
     --busy: #e8a33d;
+    /* 播报用紫色：红色在这个页面里专指"正在录音"，
+       播报时麦克风其实在听你打断，不是收音入档，两者不能混。 */
+    --speak: #7a5af8;
     --shadow: 0 1px 2px rgba(16, 24, 40, .06), 0 6px 20px rgba(16, 24, 40, .06);
     --radius: 14px;
   }
@@ -74,6 +77,32 @@
   #btn-finish { background: var(--accent); border-color: var(--accent); color: #fff; }
   #btn-drop { color: var(--rec); border-color: var(--rec); background: transparent; }
   #btn-drop:hover { background: var(--rec); color: #fff; }
+
+  /* ---------- 播报中：紫色呼吸灯 + 停止按钮 ---------- */
+  /* 刻意不用红色 —— 播报时麦克风是开着的，但它在听你打断，不是在录音。 */
+  .status[data-state="playing"] { border-color: rgba(122, 90, 248, .45); }
+  .status[data-state="playing"] .dot {
+    background: var(--speak); animation: pulse 1.4s infinite;
+  }
+  .speak-controls { display: flex; gap: 8px; }
+  .speak-controls[hidden] { display: none; }
+  #btn-stop-tts {
+    color: var(--speak); border-color: var(--speak);
+    background: transparent; font-weight: 600;
+  }
+  #btn-stop-tts:hover { background: var(--speak); color: #fff; }
+
+  /* ---------- 自动播报开关 ---------- */
+  .tts-toggle {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 13.5px; color: var(--muted); cursor: pointer;
+    border: 1px solid var(--line); border-radius: 9px; padding: 8px 12px;
+    background: var(--panel); user-select: none;
+  }
+  .tts-toggle input { margin: 0; accent-color: var(--speak); cursor: pointer; }
+  .tts-toggle.unavailable { opacity: .55; cursor: not-allowed; }
+  .tts-toggle.warned { border-color: var(--busy); }
+  .tts-toggle.warned span { color: var(--busy); }
 
   .hint {
     margin-top: 10px; color: var(--muted); font-size: 13px;
@@ -152,6 +181,12 @@
   .card-actions .del:hover { background: var(--rec); border-color: var(--rec); }
   .card-actions button[disabled] { opacity: .45; cursor: default; }
   .card-actions button[disabled]:hover { color: var(--muted); background: transparent; border-color: transparent; }
+  /* 正在播报这张卡：描一道紫边，听觉和视觉对得上 */
+  .card.speaking { border-color: var(--speak); box-shadow: 0 0 0 1px var(--speak), var(--shadow); }
+  .card-actions button[data-act="speak"]:hover,
+  .card-actions button[data-act="stop-tts"]:not([disabled]):hover {
+    background: var(--speak); border-color: var(--speak); color: #fff;
+  }
   .time { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; }
 
   /* ---------- 可直接编辑的字段 ---------- */
@@ -261,6 +296,10 @@
           <button id="btn-finish" title="立刻截断当前录音，送去 DeepSeek 整理并落库">⏹️ 结束并整理</button>
           <button id="btn-drop" title="丢弃当前这段录音：不转写、不整理、不入库">❌ 放弃本条</button>
         </span>
+        <span class="speak-controls" id="speak-controls" hidden>
+          <button id="btn-stop-tts"
+                  title="立刻停止朗读（浏览器语音队列会当场取消）">⏹️ 停止朗读</button>
+        </span>
         <span class="stats">
           本次已记录 <b id="count">{{ snapshot.saved_count }}</b> 条<span id="cancelled-wrap"
             {%- if not snapshot.cancelled_count %} hidden{% endif %}> · 作废 <b id="cancelled">{{ snapshot.cancelled_count }}</b> 条</span><br>
@@ -276,7 +315,9 @@
       录音途中说 <code>{{ cancel_words }}</code> 直接丢弃本条 ·
       静音 <code>{{ silence_s }}s</code> 也会自动保存 ·
       说错了就用状态栏里的
-      <b>⏹️ 结束并整理</b> / <b>❌ 放弃本条</b> 手动收尾
+      <b>⏹️ 结束并整理</b> / <b>❌ 放弃本条</b> 手动收尾 ·
+      朗读由浏览器原生语音完成：点卡片上的 <b>🔊 朗读分析</b> 开始，
+      点 <b>⏹️ 停止朗读</b> 或再点一次同一个 <b>🔊</b> 立即打断
     </div>
   </header>
 
@@ -285,6 +326,11 @@
     <a class="btn" href="/api/export?fmt=docx">⬇ 导出 Word</a>
     <button id="merge" disabled title="至少勾选 2 条记录才能合并">🔗 合并选中项并重新整理</button>
     <span class="picked-count" id="picked" hidden>已选 <b id="picked-n">0</b> 条</span>
+    <label class="tts-toggle" id="tts-toggle-wrap"
+           title="整理完 / 重新润色 / 合并之后，自动用浏览器原生语音念出【诊断思考】与【诊疗计划】">
+      <input type="checkbox" id="tts-toggle" checked>
+      <span>自动语音朗读结果</span>
+    </label>
     <input type="text" id="manual" placeholder="也可以直接打字，回车即整理成卡片…">
     <button id="send">整理</button>
   </div>
@@ -301,6 +347,8 @@
         <span class="card-actions">
           <button class="act" data-act="save" data-id="{{ m.id }}" title="保存这张卡片上的手工修改：数据库与 my_memos.md 同步更新">💾 保存修改</button>
           <button class="act" data-act="regen" data-id="{{ m.id }}" title="交给 DeepSeek 做临床推演：基于你问到的东西推导诊断思考与诊疗计划（你亲手改过的段落会被原样保留）">🔄 智能润色/推演</button>
+          <button class="act" data-act="speak" data-id="{{ m.id }}" title="用语音朗读这张卡片的【诊断思考】与【诊疗计划】">🔊 朗读分析</button>
+          <button class="act" data-act="stop-tts" data-id="{{ m.id }}" title="立刻停止朗读" disabled>⏹️ 停止朗读</button>
           <button class="del" data-id="{{ m.id }}" title="删除这条记录">🗑️ 删除</button>
         </span>
       </div>
@@ -348,6 +396,8 @@
   "use strict";
   const $ = (id) => document.getElementById(id);
   const statusBox = $("status"), cards = $("cards");
+  const ttsBox = $("tts-toggle"), ttsWrap = $("tts-toggle-wrap");
+  const btnStopTts = $("btn-stop-tts"), speakControls = $("speak-controls");
   const WAKE_WORD = {{ snapshot.wake_word | tojson }};
 
   function esc(value) {
@@ -366,14 +416,16 @@
   }
 
   // ---------- 状态 ----------
+  // 后端只报"录音/整理/待机"；"正在朗读"是页面自己的状态，由 Web Speech 维护。
+  let lastServerState = null;
+
   function applyState(data) {
-    statusBox.dataset.state = data.state || "standby";
-    $("status-label").textContent = data.label || "";
-    $("status-detail").textContent = data.detail || "麦克风已就绪";
+    lastServerState = data;
     $("count").textContent = data.saved_count != null ? data.saved_count : "0";
     $("updated").textContent = data.updated_at || "";
     applyCancelled(data.cancelled_count);
     applyLiveControls(data.state);
+    renderSpeechUI();
   }
 
   // 手动控制按钮只在"正在录音"时露出来 —— 待机/整理中点它没有意义
@@ -419,6 +471,329 @@
     $("cancelled-wrap").hidden = n <= 0;
   }
 
+  // ---------- 语音朗读：浏览器原生 Web Speech API ----------
+  // 后端不再合成音频。整理 / 润色 / 合并完成后，服务端只推一条
+  // {"type":"announce", memo, source}；页面收到后用 speechSynthesis 开口。
+  // 好处：没有 edge-tts 的地区 403，也不占后端 CPU；代价是打断只能靠按钮
+  // （浏览器语音不经过后端，语音识别层自然听不到"停"）。
+  const synth = window.speechSynthesis;
+  const Utterance = window.SpeechSynthesisUtterance;
+  const speechSupported = !!(synth && Utterance);
+  const AUTO_SPEAK_KEY = "voice-memo.auto-speak";
+  const SPEAK_RATE = 0.95;          // 比默认稍慢，像医生从容讲解
+  const SPEAK_PITCH = 1.0;
+  const SECTION_PAUSE_MS = 520;     // 诊断思考 → 诊疗计划之间的换气
+  const SENTENCE_PAUSE_MS = 180;    // 长段落内部句与句之间的停顿
+
+  let autoSpeak = true;
+  try {
+    const saved = localStorage.getItem(AUTO_SPEAK_KEY);
+    if (saved === "0") { autoSpeak = false; }
+    if (saved === "1") { autoSpeak = true; }
+  } catch (e) { /* 隐私模式下 localStorage 可能不可用，保持默认开启 */ }
+
+  let speechActive = false;
+  let speechToken = 0;              // 每次取消 +1；迟到的 onend/onerror 不再推进队列
+  let speechTimer = null;
+  let currentUtterance = null;
+  let speakingCardId = null;        // 正在念哪张卡（描紫边、决定再点是否停止）
+  let cachedVoices = [];
+  let voiceWarned = false;          // "没有中文发音人"只提醒一次
+
+  // 自动过滤 + 打分：优先 zh-CN、natural/neural、微软/苹果高质量音色
+  function loadVoices() {
+    if (!speechSupported) { cachedVoices = []; return cachedVoices; }
+    try { cachedVoices = synth.getVoices() || []; }
+    catch (e) { cachedVoices = []; }
+    return cachedVoices;
+  }
+
+  function voiceScore(voice) {
+    const lang = String(voice.lang || "").toLowerCase().replace("_", "-");
+    const name = String(voice.name || "");
+    let score = 0;
+    if (lang === "zh-cn" || lang.indexOf("zh-cn") === 0) { score += 60; }
+    else if (lang.indexOf("zh") === 0) { score += 30; }
+    else { score -= 100; }
+    if (/natural|neural|online/i.test(name)) { score += 50; }
+    if (/xiaoxiao|xiaoyi|yunxi|yunyang|yunye|yunjian|nanami/i.test(name)) { score += 35; }
+    if (/microsoft|apple|google/i.test(name)) { score += 20; }
+    if (voice.localService) { score += 5; }   // 本机音色通常更稳、延迟更低
+    if (/compact|espeak|pico|festival/i.test(name)) { score -= 40; }
+    return score;
+  }
+
+  function pickVoice() {
+    const voices = cachedVoices.length ? cachedVoices : loadVoices();
+    if (!voices.length) { return null; }
+    const chinese = voices.filter((v) => /^zh/i.test(v.lang || ""));
+    // 没有中文音色时宁可让浏览器用默认发音，也不硬塞一个英语声音念中文
+    if (!chinese.length) { return null; }
+    return chinese.slice().sort((a, b) => voiceScore(b) - voiceScore(a))[0] || null;
+  }
+
+  function updateTtsAvailability() {
+    if (!ttsBox) { return; }
+    ttsBox.checked = autoSpeak;
+    ttsBox.disabled = !speechSupported;
+    if (!ttsWrap) { return; }
+    ttsWrap.classList.toggle("unavailable", !speechSupported);
+    if (!speechSupported) {
+      ttsWrap.title = "当前浏览器不支持 Web Speech API，请改用 Chrome / Edge / Safari";
+      return;
+    }
+    const voice = pickVoice();
+    ttsWrap.title = voice
+      ? "整理 / 润色 / 合并后自动朗读（浏览器音色：" + voice.name + "）"
+      : "整理 / 润色 / 合并后自动朗读（未找到中文发音人，可在系统设置里添加中文语音包）";
+  }
+
+  // 把一段文本按句号/问号/分号切成短句；单句过长再按逗号切，最后才硬切。
+  function splitLongText(text, limit) {
+    const sentences = (String(text).match(/[^。！？!?；;\n]+[。！？!?；;]?/g) || [])
+      .map((s) => s.trim()).filter(Boolean);
+    const chunks = [];
+    let buffer = "";
+    const flush = () => { if (buffer.trim()) { chunks.push(buffer.trim()); } buffer = ""; };
+    sentences.forEach((sentence) => {
+      if (buffer && (buffer + sentence).length > limit) { flush(); }
+      let rest = sentence;
+      while (rest.length > limit) {
+        let cut = Math.max(
+          rest.lastIndexOf("，", limit),
+          rest.lastIndexOf("、", limit),
+          rest.lastIndexOf(",", limit)
+        );
+        if (cut < Math.floor(limit * 0.4)) { cut = limit; }   // 找不到合适的逗号才硬切
+        chunks.push(rest.slice(0, cut + 1).trim());
+        rest = rest.slice(cut + 1).trim();
+      }
+      if (!rest) { return; }
+      if ((buffer + rest).length > limit) { flush(); }
+      buffer += rest;
+    });
+    flush();
+    return chunks.filter(Boolean);
+  }
+
+  const SPEECH_OPENERS = {
+    organize: "小医为您分析完毕。",
+    regenerate: "小医为您重新推演完毕。",
+    merge: "小医已把多次记录合并完毕。",
+    manual: "小医为您朗读这条记录。",
+  };
+
+  function cleanSpeechText(value) {
+    return String(value == null ? "" : value)
+      .replace(/\r/g, "")
+      .replace(/[\t ]+/g, " ")
+      .replace(/ *\n+ */g, "\n")
+      .replace(/\n{2,}/g, "\n")
+      .trim();
+  }
+
+  // 播报稿：开场白 → 诊断思考 → 诊疗计划；模块之间留出可听的停顿。
+  function memoSpeechPlan(memo, source) {
+    const assessment = cleanSpeechText(memo && memo.assessment);
+    const plan = cleanSpeechText(memo && memo.plan);
+    if (!assessment && !plan) { return []; }
+    const sections = [];
+    sections.push({
+      text: SPEECH_OPENERS[source] || SPEECH_OPENERS.manual,
+      pause: SECTION_PAUSE_MS,
+    });
+    if (assessment) {
+      sections.push({ text: "诊断思考：" + assessment, pause: SECTION_PAUSE_MS });
+    }
+    if (plan) {
+      sections.push({ text: "诊疗计划：" + plan, pause: 0 });
+    }
+    const planSteps = [];
+    sections.forEach((section) => {
+      const parts = splitLongText(section.text, 90);
+      parts.forEach((part, index) => {
+        planSteps.push({
+          text: part,
+          pause: index === parts.length - 1 ? section.pause : SENTENCE_PAUSE_MS,
+        });
+      });
+    });
+    return planSteps;
+  }
+
+  function finishSpeech() {
+    speechActive = false;
+    speakingCardId = null;
+    currentUtterance = null;
+    clearTimeout(speechTimer);
+    speechTimer = null;
+    renderSpeechUI();
+  }
+
+  // 立即取消：按钮点下去必须当场静音，不能等当前这句念完。
+  function cancelSpeech(quiet) {
+    speechToken += 1;                    // 让还在飞的 onend/onerror 全部作废
+    clearTimeout(speechTimer);
+    speechTimer = null;
+    currentUtterance = null;
+    try { if (speechSupported) { synth.cancel(); } } catch (e) { /* 浏览器实现差异 */ }
+    const wasSpeaking = speechActive;
+    speechActive = false;
+    speakingCardId = null;
+    renderSpeechUI();
+    if (wasSpeaking && !quiet) { toast("已停止朗读"); }
+    return wasSpeaking;
+  }
+
+  function speakPlan(steps, cardId) {
+    if (!speechSupported) {
+      toast("当前浏览器不支持语音朗读，请改用 Chrome / Edge / Safari");
+      return false;
+    }
+    if (!steps.length) {
+      toast("这张卡片没有【诊断思考】或【诊疗计划】可念");
+      return false;
+    }
+    cancelSpeech(true);                  // 新朗读一律先掐掉旧的，避免两段声音叠在一起
+    const token = speechToken;
+    speechActive = true;
+    speakingCardId = cardId == null ? null : String(cardId);
+    renderSpeechUI();
+
+    let index = 0;
+    const next = () => {
+      if (token !== speechToken) { return; }       // 已被取消/替换
+      if (index >= steps.length) { finishSpeech(); return; }
+      const step = steps[index++];
+      const utter = new Utterance(step.text);
+      utter.lang = "zh-CN";
+      utter.rate = SPEAK_RATE;
+      utter.pitch = SPEAK_PITCH;
+      utter.volume = 1;
+      const voice = pickVoice();
+      if (voice) { utter.voice = voice; }
+      else if (!voiceWarned) {
+        voiceWarned = true;
+        toast("未找到中文发音人，朗读可能不自然；可在系统设置里添加中文语音包");
+      }
+      currentUtterance = utter;
+      utter.onend = () => {
+        if (token !== speechToken) { return; }
+        currentUtterance = null;
+        if (step.pause > 0) {
+          speechTimer = setTimeout(next, step.pause);
+        } else {
+          next();
+        }
+      };
+      utter.onerror = (event) => {
+        if (token !== speechToken) { return; }
+        const reason = (event && event.error) || "";
+        currentUtterance = null;
+        if (reason === "interrupted" || reason === "canceled") { return; }
+        finishSpeech();
+        if (reason === "not-allowed") {
+          toast("浏览器拦截了自动朗读，请点卡片上的 🔊 朗读分析");
+        } else {
+          toast("朗读中断：" + (reason || "未知原因"));
+        }
+      };
+      try {
+        synth.speak(utter);
+        // Chrome 刚 cancel 完偶尔会停在 paused，补一次 resume 让队列继续
+        if (synth.paused) { try { synth.resume(); } catch (e) { /* 忽略 */ } }
+      } catch (err) {
+        finishSpeech();
+        toast("朗读启动失败：" + err);
+      }
+    };
+    // cancel 与 speak 之间的极短间隔能避开 Chrome 的"取消后立刻说"竞态
+    speechTimer = setTimeout(next, 40);
+    return true;
+  }
+
+  function memoFromCard(id) {
+    const card = currentCard(id);
+    if (!card) { return null; }
+    const read = (field) => {
+      const node = card.querySelector('[data-field="' + field + '"]');
+      // innerText 保留 contenteditable 里的换行，念起来才有段落感
+      return node ? (node.innerText || "").trim() : "";
+    };
+    return { id: id, assessment: read("assessment"), plan: read("plan") };
+  }
+
+  // 卡片上的 🔊：第一次点开始，朗读中再点同一个按钮 = 立即停止。
+  function speakCard(id) {
+    const key = String(id);
+    if (speechActive && speakingCardId === key) {
+      cancelSpeech(false);
+      return;
+    }
+    const memo = memoFromCard(key);
+    if (!memo) { toast("没找到这张卡片"); return; }
+    speakPlan(memoSpeechPlan(memo, "manual"), key);
+  }
+
+  // 后台 announce 事件：整理 / 润色 / 合并完成后自动念（可在工具栏关掉）。
+  function speakMemo(memo, source) {
+    if (!autoSpeak) { return false; }
+    // 后台标签页不抢着说话：同一个后端开着多个页面时，避免几个窗口一起出声
+    if (document.visibilityState === "hidden") { return false; }
+    return speakPlan(memoSpeechPlan(memo, source || "organize"), memo && memo.id);
+  }
+
+  function setSpeakingCard(id) {
+    speakingCardId = id == null ? null : String(id);
+    Array.prototype.forEach.call(cards.querySelectorAll(".card"), (card) => {
+      card.classList.toggle("speaking", card.dataset.id === speakingCardId);
+    });
+  }
+
+  // 页面自己的"正在朗读"状态，和后端状态合并显示：
+  // 录音/整理时后端状态更重要，只在后端待机时才把顶栏切成紫色朗读态。
+  function renderSpeechUI() {
+    const base = lastServerState || {};
+    const baseState = base.state || "standby";
+    const showSpeaking = speechActive && baseState === "standby";
+    statusBox.dataset.state = showSpeaking ? "playing" : baseState;
+    $("status-label").textContent = showSpeaking
+      ? "🔊 正在朗读诊断与计划..."
+      : (base.label || "");
+    $("status-detail").textContent = showSpeaking
+      ? "点「⏹️ 停止朗读」或再点一次该卡片的 🔊 即可打断"
+      : (base.detail || "麦克风已就绪");
+
+    if (speakControls) { speakControls.hidden = !speechActive; }
+    Array.prototype.forEach.call(
+      document.querySelectorAll('button[data-act="stop-tts"]'),
+      (btn) => { btn.disabled = !speechActive; }
+    );
+    setSpeakingCard(speechActive ? speakingCardId : null);
+    updateTtsAvailability();
+  }
+
+  function toggleAutoSpeak() {
+    autoSpeak = !!(ttsBox && ttsBox.checked);
+    try { localStorage.setItem(AUTO_SPEAK_KEY, autoSpeak ? "1" : "0"); }
+    catch (e) { /* 隐私模式：只在本次页面生效 */ }
+    if (!autoSpeak) { cancelSpeech(true); }
+    updateTtsAvailability();
+    toast(autoSpeak ? "已开启自动朗读（整理 / 润色 / 合并完成后）" : "已关闭自动朗读");
+  }
+
+  if (speechSupported) {
+    loadVoices();
+    // Chrome 的音色列表是异步加载的，第一次 getVoices() 常常是空数组
+    synth.onvoiceschanged = () => { loadVoices(); updateTtsAvailability(); };
+  }
+  if (ttsBox) { ttsBox.addEventListener("change", toggleAutoSpeak); }
+  if (btnStopTts) {
+    btnStopTts.addEventListener("click", () => cancelSpeech(false));
+  }
+  updateTtsAvailability();
+  renderSpeechUI();
+
   // ---------- 卡片 ----------
   // 这段 DOM 结构必须与服务端 Jinja 渲染出来的**逐字一致**：SSE 推来的卡片走这里，
   // 首屏卡片走模板，两边长得不一样就会出现"刷新一下样式就变了"的诡异现象。
@@ -427,6 +802,8 @@
     return '<span class="card-actions">' +
       '<button class="act" data-act="save" data-id="' + key + '" title="保存这张卡片上的手工修改：数据库与 my_memos.md 同步更新">💾 保存修改</button>' +
       '<button class="act" data-act="regen" data-id="' + key + '" title="交给 DeepSeek 做临床推演：基于你问到的东西推导诊断思考与诊疗计划（你亲手改过的段落会被原样保留）">🔄 智能润色/推演</button>' +
+      '<button class="act" data-act="speak" data-id="' + key + '" title="用语音朗读这张卡片的【诊断思考】与【诊疗计划】">🔊 朗读分析</button>' +
+      '<button class="act" data-act="stop-tts" data-id="' + key + '" title="立刻停止朗读，回到待机" disabled>⏹️ 停止朗读</button>' +
       '<button class="del" data-id="' + key + '" title="删除这条记录">🗑️ 删除</button>' +
       "</span>";
   }
@@ -489,6 +866,10 @@
     const key = String(m.id);
     el.querySelector("input.memo-select").checked = selected.has(key);
     el.classList.toggle("picked", selected.has(key));
+    // 重渲染会把节点换掉，播报中的紫边和停止按钮状态得从页面级变量恢复
+    if (speakingCardId === key) { el.classList.add("speaking"); }
+    const stopBtn = el.querySelector('button[data-act="stop-tts"]');
+    if (stopBtn) { stopBtn.disabled = !speechActive; }
     settle(el);          // 新卡也走一遍入场动画，之后要能淡出
     return el;
   }
@@ -834,6 +1215,8 @@
     if (!act || act.disabled) { return; }
     if (act.dataset.act === "save") { saveCard(act.dataset.id, act); }
     else if (act.dataset.act === "regen") { regenerateCard(act.dataset.id, act); }
+    else if (act.dataset.act === "speak") { speakCard(act.dataset.id); }
+    else if (act.dataset.act === "stop-tts") { cancelSpeech(false); }
   });
 
   // 一改就标脏：卡片描一道蓝边，提醒"这里还没存"。智能润色会把改动一起带走，
@@ -869,6 +1252,10 @@
       if (applyMemo(data.memo, false) && !justMerged.has(String(data.memo.id))) {
         toast("已生成新卡片：" + (data.memo.title || "未命名"));
       }
+    } else if (data.type === "announce" && data.memo) {
+      // 后端的"整理 / 润色 / 合并完成"信号：是否开口由页面上的自动朗读开关决定。
+      // 卡片内容已经随事件一起送来，不必等 memo 事件先渲染完。
+      speakMemo(data.memo, data.source || "organize");
     } else if (data.type === "delete" && data.id != null) {
       removeCardNode(data.id, true);     // 别的标签页删的，这边同步消失
     } else if (data.type === "cancel") {

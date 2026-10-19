@@ -166,7 +166,8 @@ EDIT_FIELD_MAX_CHARS = 4000
 #: 但模型重新生成时理应一并刷新 —— 两个白名单的差别就是"谁能写"的区别。
 REGENERATE_FIELDS = ("title", "category", "summary", "todos") + SOAP_COLUMNS
 
-# 监听状态机的三个状态（Web 界面直接显示这三个）
+# 监听状态机的三个状态（Web 界面直接显示这三个）。
+# "正在朗读"不再由后端维护 —— 浏览器用 Web Speech API 出声，状态也由页面自己管。
 STATE_STANDBY = "standby"
 STATE_RECORDING = "recording"
 STATE_PROCESSING = "processing"
@@ -2218,8 +2219,9 @@ def match_command_detail(text: str, cfg: "Config",
     """判断识别文本里有没有语音指令，返回 ``(指令类别, 命中的词)``，没有则 None。
 
     类别是 ``"wake"``（唤醒）/ ``"segment_end"``（分段保存）/ ``"cancel"``（作废本条）
-    / ``"exit"``（退出程序）。判定顺序即优先级：退出 > 作废 > 分段 > 唤醒 ——
-    一句话里出现多个时，听用户最后那道指令（"录音完毕，这条不要了" = 别存）。
+    / ``"exit"``（退出程序）。判定顺序即优先级：
+    退出 > 作废 > 分段 > 唤醒 —— 一句话里出现多个时，听用户最后那道指令
+    （"录音完毕，这条不要了" = 别存）。
 
     ``groups`` 用来限定这一次只找哪几类（后台扫描每次只关心一部分，能省不少算力）。
     """
@@ -3076,8 +3078,9 @@ class VoiceListener:
             reader = threading.Thread(target=self._reader, args=(stream,), name="audio-reader", daemon=True)
             reader.start()
 
-            # 待机时滚动保留最近一段音频，用来找唤醒词；免唤醒模式只需回溯缓冲那么长
-            window_s = cfg.wake_window_s if wake_mode else cfg.pre_speech_pad_ms / 1000.0
+            # 待机时滚动保留最近一段音频，用来找唤醒词；免唤醒模式只需回溯缓冲那么长。
+            window_s = (cfg.wake_window_s
+                        if wake_mode else cfg.pre_speech_pad_ms / 1000.0)
             rolling: "collections.deque" = collections.deque(
                 maxlen=max(1, int(window_s * cfg.sample_rate / cfg.chunk_size))
             )
@@ -3096,7 +3099,8 @@ class VoiceListener:
 
             def back_to_idle() -> None:
                 """一段（或一次尝试）结束：清缓冲与 VAD 状态，回到待机等下一个唤醒词。"""
-                nonlocal buffer, started_at, pending_speech_start, speech_active, last_scan_at
+                nonlocal buffer, started_at, pending_speech_start, speech_active
+                nonlocal last_scan_at
                 self._scan_epoch += 1            # 让还在飞的判定结果作废
                 self._scan_result = None
                 buffer = []
@@ -3189,11 +3193,13 @@ class VoiceListener:
                         speech_active = True
                         pending_speech_start = captured_at   # 开口时刻，唤醒后拿它当 record_time
                         if not wake_mode:
-                            # 免唤醒模式：听到人声直接开录（rolling 就是回溯缓冲）
+                            # 免唤醒模式：听到人声直接开录（rolling 就是回溯缓冲）。
                             begin_recording(pending_speech_start)
                     if "end" in event:
                         speech_active = False
-                    if started_at is None and wake_mode:
+
+                    # 待机时只扫唤醒/退出；免唤醒模式没有唤醒词可找，直接不扫。
+                    if wake_mode:
                         # 说话途中反复扫；刚说完再补扫一次（唤醒词的最后一班车）
                         if (speech_active and self._scan_due(last_scan_at, cfg)) or "end" in event:
                             if self._start_scan(rolling, ("exit", "wake")):
@@ -3463,7 +3469,7 @@ class AppState:
 
     def snapshot(self) -> dict:
         with self._lock:
-            return {
+            data = {
                 "state": self.state,
                 "label": self.label(),
                 "detail": self.detail,
@@ -3475,6 +3481,7 @@ class AppState:
                 "wake_mode": self.wake_mode,
                 "wake_word": self.wake_word,
             }
+        return data
 
     # -- 写 ---------------------------------------------------------------- #
     def set_state(self, state: str, detail: str = "") -> None:
@@ -3498,6 +3505,25 @@ class AppState:
             self.last_memo_id = memo.get("id")
         self.broadcaster.publish({"type": "memo", "memo": memo_to_dict(memo)})
         self.set_state(self.state, self.detail)     # 让页面上的统计数字立刻刷新
+
+    def publish_announce(self, memo: dict, source: str = "organize") -> bool:
+        """请浏览器用 Web Speech 念一遍这张卡的诊断思考与诊疗计划。
+
+        后端不再合成任何音频 —— 这里只是往 SSE 里放一条 ``announce`` 事件，
+        真正开口的是页面上的 ``window.speechSynthesis``。这样既没有网络 403，
+        也不占后端 CPU。没有可念的内容时**不发事件**，页面也就不会先念一句
+        "为您分析完毕"然后沉默。
+        """
+        payload = memo_to_dict(memo)
+        if not ((payload.get("assessment") or "").strip()
+                or (payload.get("plan") or "").strip()):
+            return False
+        self.broadcaster.publish({
+            "type": "announce",
+            "source": source,
+            "memo": payload,
+        })
+        return True
 
     def publish_cancel(self, keyword: str = "", text: str = "") -> None:
         """语音作废了一条录音 —— 页面弹个提示，并更新"作废"计数。"""
@@ -3562,12 +3588,14 @@ class MemoPipeline:
 
     def __init__(self, cfg: Config, conn: sqlite3.Connection,
                  transcriber: Transcriber, client: Optional[Any] = None,
-                 on_memo: Optional[Callable[[dict], None]] = None):
+                 on_memo: Optional[Callable[[dict], None]] = None,
+                 on_announce: Optional[Callable[[dict, str], bool]] = None):
         self.cfg = cfg
         self.conn = conn
         self.transcriber = transcriber
         self.client = client
         self.on_memo = on_memo          # 新卡片 → 推给 Web 界面
+        self.on_announce = on_announce  # 整理完 → 通知浏览器用 Web Speech 朗读
 
     def handle_audio(self, utterance: Utterance) -> Optional[int]:
         log("本地识别中…", "ASR")
@@ -3607,7 +3635,18 @@ class MemoPipeline:
                 self.on_memo(memo)
             except Exception as exc:      # Web 界面出问题绝不能影响落库
                 log(f"推送新卡片失败：{type(exc).__name__}: {exc}", "Web")
+        self.announce(memo)
         return memo_id
+
+    def announce(self, memo: dict, source: str = "organize") -> bool:
+        """通知页面朗读【诊断思考】+【诊疗计划】。失败**绝不影响**落库结果。"""
+        if self.on_announce is None:
+            return False
+        try:
+            return bool(self.on_announce(memo, source))
+        except Exception as exc:
+            log(f"播报事件推送失败：{type(exc).__name__}: {exc}", "播报")
+            return False
 
 
 def print_memo(memo: dict, memo_id: Optional[int] = None, source: str = "") -> None:
@@ -3921,6 +3960,8 @@ def run_doctor(cfg: Config) -> int:
         print(f"  [ OK ] flask 已安装，可用 --web → http://{cfg.web_host}:{cfg.web_port}")
     else:
         print("  [ -- ] flask 未安装，--web 不可用（pip install flask）")
+    print("  [ OK ] 语音播报 = 浏览器 Web Speech API（无需 edge-tts / 声卡后端）")
+    print("         在网页上点 🔊 朗读分析即可出声；播报开关与音色由浏览器决定")
     print(f"  [ OK ] 蜂鸣提示 = {'开' if cfg.beep else '关'}")
     if cfg.markdown_path:
         print(f"  [ OK ] 自动追加 Markdown = {Path(cfg.markdown_path).resolve()}")
@@ -4091,7 +4132,12 @@ def main(argv: Optional[list] = None) -> int:
     # 状态与推送：Web 界面靠它实时刷新，命令行模式下它只是个安静的中转站
     wake_mode = bool(cfg.wake_word_enabled and cfg.wake_word)
     state = AppState(wake_mode=wake_mode, wake_word=cfg.wake_word)
-    pipeline = MemoPipeline(cfg, conn, transcriber, client, on_memo=state.publish_memo)
+
+    # 朗读完全交给浏览器（Web Speech API）：后端只推一条 announce 事件，
+    # 不合成音频、不依赖 edge-tts / 声卡，也不再有地区 403。
+    pipeline = MemoPipeline(cfg, conn, transcriber, client,
+                            on_memo=state.publish_memo,
+                            on_announce=state.publish_announce)
     listener: Optional[VoiceListener] = None
     web_app: Optional[Any] = None
 

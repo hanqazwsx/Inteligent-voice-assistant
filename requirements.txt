@@ -44,6 +44,11 @@ openai>=1.30.0              # 仅用作 HTTP 客户端，不依赖其云服务
 # ---------- Web 看板 ----------
 flask>=3.0.0                # 只有 `python main.py --web` 需要，纯命令行模式用不到
 
+# ---------- 语音朗读 ----------
+# 不需要任何 Python 依赖：朗读由浏览器原生 Web Speech API（window.speechSynthesis）
+# 完成。后端只通过 SSE 推一条 announce 事件，不合成音频、不播放音频。
+# 浏览器端建议用 Chrome / Edge / Safari；系统里装了中文语音包效果更好。
+
 # ---------- 可选 ----------
 # python-docx>=1.1.0        # 仅 --export-docx 需要：pip install python-docx
                             # Markdown 导出（默认功能）不需要任何额外依赖

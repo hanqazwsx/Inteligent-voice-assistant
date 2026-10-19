@@ -22,9 +22,13 @@
 ``POST /api/control/finish``  手动结束并整理当前录音（说不出指令词时的双保险）
 ``POST /api/control/cancel``  手动放弃当前录音（不转写、不入库）
 ``POST /api/memos/update/<id>``        💾 保存修改：contenteditable 回写（数据库 + my_memos.md 同步）
-``POST /api/memos/re-summarize/<id>``  🔄 智能润色/推演：交给 DeepSeek 做临床推理后写回
-``POST /api/memos/merge``              🔗 多选合并：把勾选的几段记录熔成一张新病历卡片
+``POST /api/memos/re-summarize/<id>``  🔄 智能润色/推演：交给 DeepSeek 做临床推理后写回（写完推 announce 事件）
+``POST /api/memos/merge``              🔗 多选合并：把勾选的几段记录熔成一张新病历卡片（合并后推 announce 事件）
 ``POST|DELETE /api/delete/<id>``  删除一张卡片（数据库 + my_memos.md 同步）
+
+朗读不在后端做：整理 / 润色 / 合并完成后，后端只通过 SSE 推一条 ``announce``
+事件（带整张卡片），由页面用浏览器原生的 Web Speech API 出声。
+``POST /api/memos/<id>/speak`` 与 ``/api/tts*`` 已经移除，避免再引入 edge-tts。
 ``GET  /api/export``       导出全部记录：``?fmt=md`` 或 ``?fmt=docx``，直接下载
 
 上面两个 ``/api/memos/...`` 是现行路径；早先的 ``/api/memo/<id>/update`` 与
@@ -57,7 +61,8 @@ def create_app(cfg: Any, conn: sqlite3.Connection, state: Any,
 
     ``cfg``      : ``main.Config``
     ``conn``     : 已打开的 sqlite3 连接（``check_same_thread=False``）
-    ``state``    : ``main.AppState``，提供 ``snapshot()`` 与 ``broadcaster``
+    ``state``    : ``main.AppState``，提供 ``snapshot()``、``broadcaster``
+                   与 ``publish_announce()``（朗读事件由它推给页面）
     ``pipeline`` : ``main.MemoPipeline``，供 ``/api/text`` 手动写入
     ``listener`` : ``main.VoiceListener``，供 ``/api/stop`` 停录音
     """
@@ -279,6 +284,8 @@ def create_app(cfg: Any, conn: sqlite3.Connection, state: Any,
         if updated is None:
             return jsonify({"ok": False, "error": f"没有 id={memo_id} 的卡片"}), 404
         synced = _sync_markdown_and_broadcast(updated)
+        # 润色完让页面念一遍新的诊断与计划（浏览器 Web Speech，失败不影响本接口）
+        state.publish_announce(updated, "regenerate")
         return jsonify({
             "ok": True,
             "id": memo_id,
@@ -403,6 +410,7 @@ def create_app(cfg: Any, conn: sqlite3.Connection, state: Any,
         synced = _refresh_markdown()
         # 新记录走 publish_memo：它会 +1 计数并广播，页面上"已记录 N 条"随之变化。
         state.publish_memo(merged)
+        state.publish_announce(merged, "merge")   # 合并完也念一遍新病历的结论
         return jsonify({
             "ok": True,
             "id": memo_id,
